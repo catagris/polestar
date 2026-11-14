@@ -329,6 +329,7 @@ mod riding;
 mod route_plan;
 #[path = "skins-sweep.rs"]
 mod skins_sweep;
+mod stats;
 mod syntax;
 mod talents;
 mod theme;

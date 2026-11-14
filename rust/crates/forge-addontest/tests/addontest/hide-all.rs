@@ -226,9 +226,9 @@ fn hiding_polestar_hides_every_surface_and_showing_it_brings_each_back_as_it_was
 	assert!(strings(&out["hidden"]).iter().any(|s| s.starts_with("Polestar/UI/Launcher.lua")), "the floating button stays: {out}");
 	assert!(strings(&out["ticking"]).is_empty() && out["ticking"].as_object().is_none_or(|o| o.is_empty()), "no frame of Polestar's runs an OnUpdate while it is hidden: {out}");
 	// What may tick while hidden: the engine's arrival poll, Nav's once-a-second tick (the travel planner and the
-	// walking engine) and the transports' sampler; nothing that draws.
+	// walking engine), the transports' sampler and the Stats counting (hidden is still playing); nothing that draws.
 	for site in strings(&out["ticked"]) {
-		assert!(["Polestar/Core/Engine.lua", "Polestar/Nav/Nav.lua", "Polestar/Nav/Transit.lua"].contains(&site.as_str()), "{site} ticks while Polestar is hidden");
+		assert!(["Polestar/Core/Engine.lua", "Polestar/Nav/Nav.lua", "Polestar/Nav/Transit.lua", "Polestar/Stats/Collect.lua"].contains(&site.as_str()), "{site} ticks while Polestar is hidden");
 	}
 	assert!(strings(&out["changed"]).is_empty() && out["changed"].as_object().is_none_or(|o| o.is_empty()), "every frame is back as it was: {out}");
 	assert_eq!(out["options"], true, "the window the player opened is open again");
@@ -489,9 +489,9 @@ fn the_menu_toggles_the_window_the_arrow_hiding_and_whether_hiding_keeps_the_arr
 		emit(seen)"#,
 	)
 	.remove(0);
-	assert_eq!(out[0], json!(["[x] Guide window", "Hide arrow", "Hide Polestar", "Keep the arrow when hidden", "Guides", "Lookup", "Options", "Report a problem"]));
+	assert_eq!(out[0], json!(["[x] Guide window", "Hide arrow", "Hide Polestar", "Keep the arrow when hidden", "Guides", "Lookup", "Stats", "Options", "Report a problem"]));
 	assert_eq!(out[1], json!([true, true]), "checked, and saved for the character");
-	assert_eq!(out[2], json!(["Guide window", "Hide arrow", "Show Polestar", "[x] Keep the arrow when hidden", "Guides", "Lookup", "Options", "Report a problem"]));
+	assert_eq!(out[2], json!(["Guide window", "Hide arrow", "Show Polestar", "[x] Keep the arrow when hidden", "Guides", "Lookup", "Stats", "Options", "Report a problem"]));
 	assert_eq!(out[3], json!([false, false]), "the arrow off (nav.arrow) while hidden and kept");
 	assert_eq!(out[4], json!([true, true, true]), "and on again: the kept arrow shows, Polestar still hidden");
 	assert_eq!(out[5], json!([false, true]), "a window from the menu brings Polestar back");

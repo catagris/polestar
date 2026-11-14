@@ -4336,6 +4336,10 @@ local function openMenu(button)
 			ns.Print(L["Guide window hidden. Type /polestar to bring it back."])
 		end },
 	}) do items[#items + 1] = it end
+	-- The Stats section of the hub (Stats/View.lua), under the Recorder's entry.
+	if ns.Stats then
+		table.insert(items, 5, { text = L["Stats"], icon = "layers", onClick = function() ns.Fire("SHOW_STATS") end })
+	end
 	-- The Recorder's window, while the Recorder addon is loaded.
 	if type(PolestarRecorder_Command) == "function" then
 		table.insert(items, 5, { text = L["Recorder window"], icon = "record", onClick = function() PolestarRecorder_Command("ui") end })
