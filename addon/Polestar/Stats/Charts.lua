@@ -7,7 +7,8 @@
 --   local p = Charts.Pool(parent)
 --   Charts.Reset(p)                       -- before each render
 --   Charts.Text(p, role, color, text, x, y[, width]) -> font string (top-left at x, -y)
---   Charts.Rect(p, layer, x, y, w, h, color[, alpha]) -> texture; color: a palette name or a wash ("wash:track")
+--   Charts.Rect(p, layer, x, y, w, h, color[, alpha]) -> texture; color: a palette name, a wash ("wash:track") or { r, g, b }
+--   Charts.Blob(p, x, y, size, color[, alpha]) -> texture: a round soft-edged mark centred on (x, y)
 --   Charts.Segment(p, x1, y1, x2, y2, color[, thickness[, alpha]]) -> line
 --   Charts.Cards(p, y, width, { { label, value }, ... }) -> y below
 --   Charts.Heading(p, y, title) -> y below
@@ -31,25 +32,29 @@ local Charts = {}
 Stats.Charts = Charts
 
 local WHITE = Theme.Media("white")
+local BLOB = "Interface\\AddOns\\" .. ADDON .. "\\Media\\Map\\blob"
 local CARD_H, CARD_GAP = 58, 12
 local ROW_H = 22
 local LABEL_W, VALUE_W = 170, 170
 
 function Charts.Pool(parent)
-	return { parent = parent, fonts = {}, rects = {}, lines = {}, nFonts = 0, nRects = 0, nLines = 0 }
+	return { parent = parent, fonts = {}, rects = {}, lines = {}, blobs = {}, nFonts = 0, nRects = 0, nLines = 0, nBlobs = 0 }
 end
 
 function Charts.Reset(p)
 	for _, fs in ipairs(p.fonts) do fs:Hide() end
 	for _, t in ipairs(p.rects) do t:Hide() end
 	for _, l in ipairs(p.lines) do l:Hide() end
-	p.nFonts, p.nRects, p.nLines = 0, 0, 0
+	for _, t in ipairs(p.blobs) do t:Hide() end
+	p.nFonts, p.nRects, p.nLines, p.nBlobs = 0, 0, 0, 0
 end
 
 function Charts.Counts(p) return p.nFonts, p.nRects, p.nLines end
 
--- A palette colour by name, or a wash as "wash:<role>".
+-- A palette colour by name, a wash as "wash:<role>", or a colour of its own
+-- as { r, g, b[, a] } (the map's marks: they sit on the map art, not the theme).
 local function rgba(color, alpha)
+	if type(color) == "table" then return color[1], color[2], color[3], (color[4] or 1) * (alpha or 1) end
 	local r, g, b, a
 	local wash = type(color) == "string" and color:match("^wash:(.+)$")
 	if wash then r, g, b, a = Theme.Wash(wash) else r, g, b, a = Theme.Color(color or "text") end
@@ -89,6 +94,23 @@ function Charts.Rect(p, layer, x, y, w, h, color, alpha)
 	t:ClearAllPoints()
 	t:SetPoint("TOPLEFT", p.parent, "TOPLEFT", x, -y)
 	t:SetSize(max(1, w), max(1, h))
+	t:SetVertexColor(rgba(color, alpha))
+	t:Show()
+	return t
+end
+
+-- Drawn in the order they are asked for: a later blob lies over an earlier one.
+function Charts.Blob(p, x, y, size, color, alpha)
+	p.nBlobs = p.nBlobs + 1
+	local t = p.blobs[p.nBlobs]
+	if not t then
+		t = p.parent:CreateTexture(nil, "ARTWORK")
+		t:SetTexture(BLOB)
+		p.blobs[p.nBlobs] = t
+	end
+	t:ClearAllPoints()
+	t:SetPoint("CENTER", p.parent, "TOPLEFT", x, -y)
+	t:SetSize(size, size)
 	t:SetVertexColor(rgba(color, alpha))
 	t:Show()
 	return t

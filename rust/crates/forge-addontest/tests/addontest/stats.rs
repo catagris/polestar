@@ -1,5 +1,6 @@
 //! The Stats section (addon/Polestar/Stats): the per-character totals (what is counted from which events, the
-//! sampler, the heat grid, the caps), the off switch, and the hub section's pages.
+//! sampler, the heat grid, the caps), the off switch, and the hub section's pages, with the one map of every zone
+//! (Stats/WorldArt.lua) where the client places zones on the world.
 
 use forge_addontest::{emitted, is_match, text, Addon, RunAddon};
 use serde_json::{json, Value};
@@ -107,11 +108,14 @@ local hours, days = 0, 0
 for _, v in pairs(a.hours) do hours = hours + v end
 for _, v in pairs(a.weekdays) do days = days + v end
 emit({ time = { a.played, a.combat, a.mounted, a.fights }, hours = hours, days = days,
-	cell = Stats.Heat(1439).t[Stats.Cell(40, 50)], active = Stats.Store().active, sessions = a.sessions })"#);
+	cell = Stats.Heat(1439).t[Stats.Cell(40, 50)], still = Stats.Heat(1439).s[Stats.Cell(40, 50)], active = Stats.Store().active,
+	sessions = a.sessions, zone = Stats.HeatMaps()[1].seconds })"#);
 	assert_eq!(out["time"], json!([8, 2, 4, 1]));
 	assert_eq!(out["hours"], 8);
 	assert_eq!(out["days"], 8);
-	assert_eq!(out["cell"], 6, "a flight is played time, not time spent in a place");
+	assert_eq!(out["cell"], 2, "time spent in a place is time on the move there: the sample that arrived");
+	assert_eq!(out["still"], 4, "standing still is kept apart; a flight is played time, not time in a place");
+	assert_eq!(out["zone"], 6, "the zones are listed by all the time in them");
 	assert_eq!(out["active"], 8);
 	assert_eq!(out["sessions"], 1);
 }
@@ -224,6 +228,9 @@ end
 local nav, active = V.Nav()
 local keys = {}
 for i, item in ipairs(nav) do keys[i] = item.separator and "-" or item.key end
+V.OnNav("character")
+local name = { V.Shown().name, UnitName("player") }
+V.OnNav("professions")
 V.OnNav("map:1439")
 local path = { V.Shown().page, V.Shown().cells, V.Shown().total }
 V.SetLayer("t")
@@ -234,20 +241,22 @@ V.SetLayer("d")
 local deaths = { V.Shown().cells, V.Shown().total }
 Polestar.Set("stats.enabled", false)
 V.Render()
-emit({ pages = pages, keys = keys, active = active, path = path, time = time, deaths = deaths, title = title,
+emit({ pages = pages, keys = keys, active = active, name = name, path = path, time = time, deaths = deaths, title = title,
 	subtitle = subtitle, offSubtitle = V.Shown().subtitle, off = V.Shown().off, section = Polestar.UI.Picker.Section() })"#,
 		WITH_UI,
 		true,
 	);
 	assert_eq!(out["section"], "Stats");
+	assert_eq!(out["name"][0], out["name"][1], "the Character page's card names the character");
+	assert!(text(&out["name"][0]).len() > 1);
 	assert_eq!(out["pages"], json!([["activity", "Activity", true], ["character", "Character", true], ["time", "Time", true], ["gold", "Gold", true], ["professions", "Professions", true]]));
 	assert_eq!(out["keys"], json!(["activity", "character", "time", "gold", "professions", "-", "map:1439"]));
 	assert_eq!(out["active"], "professions");
-	assert_eq!(out["time"], json!(["map:1439", 1439, 1, 62]), "the ticker's minute and the one sample");
-	assert_eq!(out["deaths"], json!([1, 1]));
+	assert_eq!(out["time"], json!(["map:1439", 1439, 4, 2]), "the sample that arrived (the minute standing there is not time on the move): one cell, spread over its neighbours, in blocks of two cells a side");
+	assert_eq!(out["deaths"], json!([4, 1]));
 	assert_eq!(out["path"], json!(["map:1439", 0, 1]), "the path layer comes first: one point where the player stood, no line yet");
 	assert_eq!(out["title"], "Darkshore");
-	assert!(is_match(text(&out["subtitle"]), r"^Counting since "));
+	assert!(is_match(text(&out["subtitle"]), r"^Counting since \S+ \d+  \x{b7}  kept on this computer only$"), "{}", out["subtitle"]);
 	assert_eq!(out["off"], true);
 	assert_eq!(out["offSubtitle"], "Turned off: showing what was counted");
 }
@@ -278,12 +287,29 @@ fn a_v1_store_moves_its_heat_onto_the_finer_grid() {
 PolestarCharDB.stats = { v = 1, heat = { [1439] = { t = { [50 * 80 + 40 + 1] = 30 }, k = { [1] = 2 } } } }
 local s = Stats.Store()
 local h = Stats.Heat(1439)
-emit({ v = s.v, grid = Stats.GRID, t = h.t[Stats.Cell(50.6, 63.1)], k = h.k[Stats.Cell(0.6, 0.6)], again = Stats.Store().heat[1439].t[Stats.Cell(50.6, 63.1)] })"#);
-	assert_eq!(out["v"], 2);
-	assert_eq!(out["grid"], 240);
+emit({ v = s.v, grid = Stats.GRID, t = h.t[Stats.Cell(50.7, 63.2)], k = h.k[Stats.Cell(0.7, 0.7)], again = Stats.Store().heat[1439].t[Stats.Cell(50.7, 63.2)] })"#);
+	assert_eq!(out["v"], 3);
+	assert_eq!(out["grid"], 480);
 	assert_eq!(out["t"], 30);
 	assert_eq!(out["k"], 2);
 	assert_eq!(out["again"], 30, "migrated once");
+}
+
+#[test]
+fn a_v2_store_shares_each_heat_cell_out_over_the_four_it_covers() {
+	let out = run(r#"
+PolestarCharDB.stats = { v = 2, heat = { [1439] = { t = { [50 * 240 + 40 + 1] = 30 }, d = { [1] = 1 } } }, trail = { [1439] = { 40005001 } } }
+local s = Stats.Store()
+local h = Stats.Heat(1439)
+local sum, n = 0, 0
+for _, v in pairs(h.t) do sum, n = sum + v, n + 1 end
+emit({ v = s.v, cells = n, sum = sum, corners = { h.t[100 * 480 + 80 + 1], h.t[101 * 480 + 81 + 1] }, deaths = h.d[1], trail = #Stats.Trail(1439) })"#);
+	assert_eq!(out["v"], 3);
+	assert_eq!(out["cells"], 4);
+	assert_eq!(out["sum"], 30, "the total is kept");
+	assert_eq!(out["corners"], json!([7.5, 7.5]));
+	assert_eq!(out["deaths"], 0.25);
+	assert_eq!(out["trail"], 1, "the walked path is untouched");
 }
 
 #[test]
@@ -320,5 +346,362 @@ emit({ whole = whole, deep = deep, corner = corner, far = far, out = out, heat =
 	assert_eq!(out["corner"], json!([true, true, true, 0]), "zooming on the top left corner leaves the path out of the frame");
 	assert_eq!(out["far"], json!([true, true, 1]), "dragged to the bottom right: the last stretch only");
 	assert_eq!(out["out"], json!([1, 50, 50, 4]));
-	assert_eq!(out["heat"], json!([true, 4]), "the heat cells are culled the same way: four of the six are in the frame");
+	assert_eq!(out["heat"], json!([true, 36]), "the heat cells are culled the same way: four of the six are in the frame, each spread over nine");
+}
+
+/// Azeroth (947) with Kalimdor (1414, 20,000 yards a side) on its left half; Darkshore (1439) and Teldrassil (1438) on it, each a
+/// twentieth of the world wide, and Darnassus (1457), a city with no overlays, inside Teldrassil. Skyreach (2000)
+/// is on no world map. Every map's art is 1002 x 668 in 4 x 3 tiles (file: map * 100 + index); Darkshore has one
+/// 300 x 200 overlay (files 501, 502) in its table, Teldrassil one explored by the character (file 601).
+const ATLAS: &str = r#"
+local w = stub.world
+w.addMap(947, { name = "Azeroth", mapType = 1 })
+w.addMap(1414, { name = "Kalimdor", mapType = 2, parent = 947, c = 1, left = 10000, right = -10000, top = 10000, bottom = -10000 })
+w.addMap(1439, { name = "Darkshore", c = 1, left = 1000, right = -1000, top = 1000, bottom = -1000, parent = 1414 })
+w.addMap(1438, { name = "Teldrassil", c = 1, left = 3000, right = 2000, top = 3000, bottom = 2000, parent = 1414 })
+w.addMap(1457, { name = "Darnassus", c = 1, left = 2600, right = 2500, top = 2600, bottom = 2500, parent = 1414 })
+w.addMap(2000, { name = "Skyreach", c = 5, left = 100, right = -100, top = 100, bottom = -100 })
+local RECTS = { [1414] = { 0, 0.5, 0, 1 }, [1439] = { 0.2, 0.25, 0.3, 0.35 }, [1438] = { 0.1, 0.15, 0.2, 0.25 }, [1457] = { 0.12, 0.125, 0.22, 0.225 } }
+function C_Map.GetMapRectOnMap(id, top)
+	local r = top == 947 and RECTS[id]
+	if r then return r[1], r[2], r[3], r[4] end
+end
+function C_Map.GetMapChildrenInfo(root, kind)
+	local out = {}
+	for id in pairs(RECTS) do
+		if (id == 1414) == (kind == 2) then out[#out + 1] = { mapID = id } end
+	end
+	return out
+end
+function C_Map.GetMapArtLayers(id)
+	if id == 947 or RECTS[id] or id == 2000 then return { { layerWidth = 1002, layerHeight = 668, tileWidth = 256, tileHeight = 256 } } end
+	return {}
+end
+function C_Map.GetMapArtLayerTextures(id) local t = {}; for i = 1, 12 do t[i] = id * 100 + i end; return t end
+function C_Map.GetMapArtID(id) return id + 9000 end
+C_MapExplorationInfo = { GetExploredMapTextures = function(id)
+	if id == 1438 then return { { textureWidth = 200, textureHeight = 200, offsetX = 400, offsetY = 200, fileDataIDs = { 601 } } } end
+	return {}
+end }
+"#;
+
+const ATLAS_PRELUDE: &str = r#"
+Polestar.UI.ZoneArt.RegisterOverlays("test", { [1439 + 9000] = { 256, 256, { 300, 200, 400, 200, 501, 502 } } })
+local w = stub.world
+local function at(map, x, y) w.moveTo(map, x, y) Stats.Tick(2) end
+local V = Polestar.UI.StatsSection
+-- The files of the map's textures in sight, as a set; masks: file -> the mask it is drawn through.
+local masks = {}
+local function files()
+	local out = {}
+	local art
+	for _, f in ipairs(stub.frames or {}) do if f.waPool then art = f end end
+	for _, t in ipairs(art and art.waPool or {}) do
+		if t:IsShown() then
+			local file = tostring(t:GetTexture())
+			out[file] = true
+			masks[file] = t.waMask and tostring(t.waMask:GetTexture()):match("[%w-]+$") or false
+		end
+	end
+	return setmetatable(out, { __index = function() return false end })
+end
+"#;
+
+fn run_atlas(script: &str) -> Value {
+	emitted(&RunAddon {
+		stubs: vec!["stub_world.lua", "stub_ui.lua"],
+		before: [WORLD, ATLAS].concat(),
+		addons: vec![Addon::files("Polestar", WITH_UI)],
+		login: true,
+		script: [PRELUDE, ATLAS_PRELUDE, script].concat(),
+		..Default::default()
+	})
+	.remove(0)
+}
+
+#[test]
+fn zones_on_the_world_map_share_one_map_and_picking_one_frames_it_there() {
+	let out = run_atlas(
+		r#"
+at(1439, 40, 50) at(1438, 50, 50) at(2000, 50, 50)
+Polestar.Fire("SHOW_STATS")
+local nav = V.Nav()
+local keys = {}
+for i, item in ipairs(nav) do keys[i] = item.separator and "-" or item.key end
+V.OnNav("world")
+local s = V.Shown()
+local opened = { s.page, s.title, s.map == nil, s.zones, s.total, s.zoom, s.focus[1], s.focus[2] }
+V.OnNav("map:1439")
+s = V.Shown()
+local _, active = V.Nav()
+local picked = { s.page, active, s.zones, s.zoom, s.focus[1], s.focus[2] }
+V.SetLayer("t")
+local kept = { V.Shown().zoom, V.Shown().cells }
+V.ResetView()
+local home = { V.Shown().zoom, V.Shown().zones }
+V.OnNav("map:2000")
+s = V.Shown()
+emit({ keys = keys, opened = opened, picked = picked, kept = kept, home = home, own = { s.page, s.map, s.title, s.zoom } })"#,
+	);
+	assert_eq!(out["keys"], json!(["activity", "character", "time", "gold", "professions", "-", "world", "map:2000"]), "the zones on the world map have no entry of their own");
+	// Both zones lie in 0.1..0.25 by 0.2..0.35 of the world: nine tenths of the frame, its middle in the middle.
+	assert_eq!(out["opened"], json!(["world", "World map", true, 2, 2, 6, 17.5, 27.5]), "the world opens on the zones played in");
+	assert_eq!(out["picked"], json!(["world", "world", 1, 18, 22.5, 32.5]), "a zone on the world opens the world's map on it");
+	assert_eq!(out["kept"], json!([18, 4]), "another layer keeps the view");
+	assert_eq!(out["home"], json!([6, 2]), "a right-click goes back to the zones played in");
+	assert_eq!(out["own"], json!(["map:2000", 2000, "Skyreach", 1]), "a zone on no world map keeps its own page");
+}
+
+#[test]
+fn the_world_art_comes_in_by_zoom_the_world_then_its_continents_then_the_zones_overlays() {
+	let out = run_atlas(
+		r#"
+at(1439, 40, 50) at(1438, 50, 50)
+Polestar.Fire("SHOW_STATS")
+V.OnNav("world")
+V.Zoom(-40)
+local a = V.Shown().art
+local far = { V.Shown().zoom, a.tiles, a.continents, a.detail, a.zones, V.Shown().painted }
+local f = files()
+local farFiles = { f["94701"], f["141401"], f["501"] }
+V.OnNav("map:1439")
+a = V.Shown().art
+f = files()
+local near = { a.continents, a.detail, a.zones, f["501"], f["502"], f["143901"], f["601"], masks["501"], masks["143901"], false }
+for file in pairs(f) do if file:match("^1414") then near[#near] = near[#near] or masks[file] end end
+local continent = false
+for file in pairs(f) do if file:match("^1414") then continent = true end end
+near[#near + 1] = continent
+V.OnNav("map:1438")
+f = files()
+local explored = { V.Shown().art.zones, f["601"], f["501"], f["143801"] }
+for _ = 1, 40 do V.Zoom(1) end
+local deepest = V.Shown().zoom
+emit({ far = far, farFiles = farFiles, near = near, explored = explored, deepest = deepest })"#,
+	);
+	assert_eq!(out["far"], json!([1, 12, 0, 0, 0, true]), "the whole world: its twelve tiles and nothing over them");
+	assert_eq!(out["farFiles"], json!([true, false, false]));
+	assert_eq!(out["near"], json!([1, 1, 1, true, true, true, false, "feather", "feather", false, true]), "a zone in close: its base and overlays, faded out at its frame, over the continent's art as it is");
+	assert_eq!(out["explored"], json!([1, true, false, true]), "a zone the table has no art for: the overlays the character has explored");
+	assert_eq!(out["deepest"], 240, "as far into the narrowest zone played in as a zone's own map goes");
+}
+
+#[test]
+fn a_city_with_no_overlays_shows_its_own_map_once_it_fills_the_frame() {
+	let out = run_atlas(
+		r#"
+at(1438, 50, 50) at(1457, 50, 50)
+Polestar.Fire("SHOW_STATS")
+V.OnNav("map:1438")
+local f = files()
+local zone = { V.Shown().zones, f["601"], f["145701"] }
+V.OnNav("map:1457")
+f = files()
+emit({ zone = zone, city = { V.Shown().zoom, f["145701"], f["145712"], masks["145701"] } })"#,
+	);
+	assert_eq!(out["zone"], json!([2, true, false]), "from the zone the city is too small for its own map");
+	assert_eq!(out["city"], json!([180, true, true, "feather-round"]), "through the rounded mask: its paper border drops away");
+}
+
+#[test]
+fn far_out_the_heat_is_summed_into_blocks_and_the_path_into_steps_that_show() {
+	let out = run_atlas(
+		r#"
+at(1439, 40, 50) at(1439, 40.5, 50) at(1439, 41, 50) at(1439, 41.5, 50)
+at(1438, 50, 50)
+Polestar.Fire("SHOW_STATS")
+V.OnNav("world")
+V.Zoom(-40)
+local farPath = V.Shown().cells
+V.SetLayer("t")
+local farHeat = { V.Shown().cells, V.Shown().zones }
+V.OnNav("map:1439")
+local nearHeat = V.Shown().cells
+V.SetLayer("p")
+emit({ farPath = farPath, farHeat = farHeat, nearHeat = nearHeat, nearPath = V.Shown().cells })"#,
+	);
+	assert_eq!(out["farPath"], 2, "lines a fraction of a pixel long would not show: a dot where each zone's path went");
+	assert_eq!(out["farHeat"], json!([3, 2]), "blocks, not cells, which are too small to see apart: Darkshore's four straddle two, Teldrassil's one is one");
+	assert_eq!(out["nearHeat"], 12, "in close they come apart");
+	assert_eq!(out["nearPath"], 3);
+}
+
+/// Two seconds of play at a place: the ticker's own sample, with the clock moving (a ride is told by speed).
+const TRAVEL: &str = r#"
+local speed = 0
+GetUnitSpeed = function() return speed, 7 end
+local function step(map, x, y) w.moveTo(map, x, y) stub.advance(2) end
+local function points(list)
+	local out = {}
+	for i, p in ipairs(list or {}) do
+		local x, y = Stats.TrailXY(p)
+		out[i] = x and { x, y } or "break"
+	end
+	return out
+end
+"#;
+
+#[test]
+fn a_flight_paths_route_is_kept_on_the_continents_map_and_drawn_on_the_flights_layer() {
+	let out = run_atlas(&[TRAVEL, r#"
+step(1439, 40, 50)
+w.onTaxi = true
+step(1439, 50, 50) step(1439, 60, 50) step(1439, 60, 50) step(1439, 70, 50)
+w.onTaxi = false
+step(1439, 70, 50)
+local a = S()
+local walked = #Stats.Trail(1439)
+Polestar.Fire("SHOW_STATS")
+V.OnNav("world")
+V.SetLayer("f")
+V.Zoom(-40)
+local s = V.Shown()
+local world = { s.page, s.cells, s.zones, s.total }
+V.OnNav("map:2000")
+emit({ route = points(Stats.Routes("f")[1414]), counted = { a.flights, a.flightSeconds }, walked = walked, world = world,
+	rides = next(Stats.Routes("r")) == nil, jumps = #Stats.Jumps() })"#].concat());
+	// Darkshore is a tenth of Kalimdor across, around its middle: 10% of the zone is 1% of the continent.
+	assert_eq!(out["route"], json!([[50, 50], [51, 50], [52, 50]]), "a point where the flight moved, on the continent's map");
+	assert_eq!(out["counted"], json!([1, 8]));
+	assert_eq!(out["walked"], 3, "the walked path stops for the flight: the take-off, a break, the landing");
+	assert_eq!(out["world"], json!(["world", 2, 1, 3]), "two segments on the one continent");
+	assert_eq!(out["rides"], true, "a flight is no ride");
+	assert_eq!(out["jumps"], 0, "and its landing no jump");
+}
+
+#[test]
+fn being_carried_faster_than_the_character_moves_is_a_ride_and_a_short_one_is_dropped() {
+	let out = run_atlas(&[TRAVEL, r#"
+step(1439, 40, 50)
+-- Running at 7 yards a second: 14 yards (0.7% of the zone) a sample is the character's own doing.
+speed = 7
+for i = 1, 5 do step(1439, 40 + i * 0.7, 50) end
+local running = { S().rides, next(Stats.Routes("r")) == nil }
+-- Standing on a boat that moves 20 yards a sample.
+speed = 0
+for i = 1, 10 do step(1439, 44 + i, 50) end
+for _ = 1, 5 do step(1439, 54, 50) end
+local boat = { S().rides, S().rideSeconds > 0, #Stats.Routes("r")[1414] }
+local ends = points(Stats.Routes("r")[1414])
+-- A lift: carried for three samples, then not.
+for i = 1, 3 do step(1439, 54 + i, 50) end
+for _ = 1, 5 do step(1439, 57, 50) end
+Polestar.Fire("SHOW_STATS")
+V.OnNav("world")
+V.SetLayer("r")
+V.Zoom(-40)
+emit({ running = running, boat = boat, first = ends[1], last = ends[#ends], after = { S().rides, #Stats.Routes("r")[1414] },
+	drawn = V.Shown().cells > 0, jumps = #Stats.Jumps() })"#].concat());
+	assert_eq!(out["running"], json!([0, true]));
+	assert_eq!(out["boat"], json!([1, true, 9]), "the ride begins on its second carried sample");
+	assert_eq!(out["first"], json!([49.6, 50]));
+	assert_eq!(out["last"], json!([50.4, 50]));
+	assert_eq!(out["after"], json!([1, 9]), "too short to be a ride: not counted, not kept");
+	assert_eq!(out["drawn"], true);
+	assert_eq!(out["jumps"], 0);
+}
+
+#[test]
+fn arriving_far_from_where_the_character_was_is_a_jump_drawn_as_a_straight_line() {
+	let out = run_atlas(&[TRAVEL, r#"
+step(1439, 50, 50)
+step(1439, 50.5, 50)
+step(1438, 50, 50)                      -- a portal: 3,500 yards in one sample
+local portal = #Stats.Jumps()
+w.inInstance = true                     -- the tram: no position inside, out again somewhere else
+for _ = 1, 30 do stub.advance(2) end
+w.inInstance = false
+step(1439, 20, 20)
+local tram = #Stats.Jumps()
+w.inInstance = true                     -- a dungeon: out again where the character went in
+for _ = 1, 30 do stub.advance(2) end
+w.inInstance = false
+step(1439, 20.2, 20)
+local j = Stats.Jumps()[1]
+Polestar.Fire("SHOW_STATS")
+V.OnNav("world")
+V.SetLayer("r")
+V.Zoom(-40)
+emit({ portal = portal, tram = tram, dungeon = #Stats.Jumps(), first = { j[1], { Stats.TrailXY(j[2]) }, j[3], { Stats.TrailXY(j[4]) } },
+	drawn = V.Shown().jumps, total = V.Shown().total })"#].concat());
+	assert_eq!(out["portal"], 1);
+	assert_eq!(out["tram"], 2);
+	assert_eq!(out["dungeon"], 2, "back where it went in: no jump");
+	assert_eq!(out["first"], json!([1414, [50.05, 50], 1414, [37.5, 37.5]]), "from and to, on the continent's map");
+	assert_eq!(out["drawn"], 2);
+	assert_eq!(out["total"], 2);
+}
+
+#[test]
+fn the_map_is_as_tall_as_the_window_has_room_for_and_its_art_fills_the_flatter_frame() {
+	let out = run_atlas(
+		r#"
+at(1439, 40, 50) at(1438, 50, 50)
+Polestar.Fire("SHOW_STATS")
+V.OnNav("world")
+local full = V.Shown().size
+-- A short window: 360 pixels of page under the tabs.
+for _, f in ipairs(stub.frames) do if f.Child then f:SetHeight(360) end end
+V.Render()
+local s = V.Shown()
+local short = s.size
+V.Zoom(-40)
+local whole = { V.Shown().zoom, V.Shown().focus[1], V.Shown().art.tiles }
+V.Pan(0, 100000)
+local top = V.Shown().focus[2]
+for _, f in ipairs(stub.frames) do if f.Child then f:SetHeight(120) end end
+V.Render()
+emit({ ratio = full[2] / full[1], width = short[1] == full[1], short = short[2], fits = short[2] < full[2] and short[2] + 102 <= 360,
+	whole = whole, top = top, half = 50 * short[2] / full[2], least = V.Shown().size[2] })"#,
+	);
+	assert!((f64(&out["ratio"]) - 2.0 / 3.0).abs() < 0.01, "with room, three wide to two high: {}", out["ratio"]);
+	assert_eq!(out["width"], true);
+	assert_eq!(out["fits"], true, "the frame, the line over it and the scale under it fit the window: {}", out["short"]);
+	assert_eq!(out["whole"][0], 1);
+	assert_eq!(out["whole"][1], 50, "the world still fills the frame's width");
+	assert!((f64(&out["top"]) - f64(&out["half"])).abs() < 0.2, "dragged down as far as it goes, the world's top edge is the frame's: {} / {}", out["top"], out["half"]);
+	assert_eq!(out["least"], 160, "never flatter than this");
+}
+
+fn f64(v: &Value) -> f64 {
+	v.as_f64().unwrap_or_else(|| panic!("not a number: {v}"))
+}
+
+#[test]
+fn heat_is_spread_over_the_neighbouring_cells_and_coloured_against_a_high_percentile() {
+	let out = run_in(
+		r#"
+local w = stub.world
+-- A hundred cells a second each along a line, and one where the character sat for an hour.
+local t = {}
+for i = 0, 99 do t[Stats.Cell(20 + i * 0.5, 40)] = 1 end
+t[Stats.Cell(97, 97)] = 3600
+PolestarCharDB.stats = { v = 3, heat = { [1439] = { t = t } } }
+Polestar.Fire("SHOW_STATS")
+local V = Polestar.UI.StatsSection
+V.OnNav("map:1439")
+V.SetLayer("t")
+for _ = 1, 40 do V.Zoom(1, 0, 0) end           -- as far in as it goes, on the top left corner: cells, not blocks
+V.Pan(-100000, -100000)                        -- then the bottom right, where the hour was sat
+local hot, strongest, n, faintest = 0, 0, 0, nil
+for _, f in ipairs(stub.frames) do
+	for _, tex in ipairs(f.regions or {}) do
+		if tex.IsShown and tex:IsShown() and tex.GetTexture and tostring(tex:GetTexture()):find("blob") then
+			n = n + 1
+			local r, g, b, a = tex:GetVertexColor()
+			strongest = math.max(strongest, a)
+			faintest = math.min(faintest or a, a)
+			if r == 1 and g < 0.2 then hot = hot + 1 end
+		end
+	end
+end
+emit({ total = V.Shown().total, cells = V.Shown().cells, blobs = n, hot = hot, alpha = { faintest, strongest } })"#,
+		WITH_UI,
+		true,
+	);
+	assert_eq!(out["total"], 3700, "spreading keeps the layer's total");
+	assert_eq!(out["cells"], 9, "the one cell in the corner, over itself and its eight neighbours");
+	assert_eq!(out["blobs"], 9);
+	assert_eq!(out["hot"], 9, "the line's cells set the scale (the hottest fiftieth), so all of the hour's spot is at the top of it, not alone there");
+	assert_eq!(out["alpha"], json!([0.2, 0.2]), "every blob as see-through as the next: only the colour says how hot");
 }

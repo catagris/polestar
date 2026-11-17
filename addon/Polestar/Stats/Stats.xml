@@ -2,5 +2,6 @@
 	<Script file="Collect.lua"/>
 	<Script file="Charts.lua"/>
 	<Script file="Options.lua"/>
+	<Script file="WorldArt.lua"/>
 	<Script file="View.lua"/>
 </Ui>

@@ -8,14 +8,15 @@
 --   Stats.Enabled() -> bool
 --   Stats.Store() -> the saved table (made when missing)
 --   Stats.Summary() -> totals over every day, for the pages (see below)
---   Stats.Heat(uiMapID) -> { t, k, x, q, d } cell tables | nil; Stats.HeatMaps() -> { { map, seconds }, ... }
+--   Stats.Heat(uiMapID) -> { t, s, k, x, q, d } cell tables | nil; Stats.HeatMaps() -> { { map, seconds }, ... }
 --   Stats.Trail(uiMapID) -> the walked path's points | nil; Stats.TrailXY(point) -> x, y in percent (nil for a break)
+--   Stats.Routes("f" | "r") -> { [continent uiMapID] = points } flown, ridden; Stats.Jumps() -> the jumps
 --   Stats.Cell(x, y) -> cell index of a map position in percent; Stats.GRID cells a side
 --   Stats.Tick(dt) -> one sampler step (the 2 s ticker calls it; tests too)
 --   Stats.Reset() -> forgets everything saved for this character
 --
 -- The saved table:
---   v = 2, since (first write), seen (last sample), active (seconds sampled, all time), sessions
+--   v = 3, since (first write), seen (last sample), active (seconds sampled, all time), sessions
 --   days["YYYYMMDD"] = { p played, c combat, f fights, m mounted, a AFK, r resting (seconds; f a count),
 --     xt XP gained, xq from quests, xe from exploring (kills are the rest), k kills, d deaths, b bosses,
 --     qa accepted, qt turned in, qr abandoned, il looted, iq quest money, iv sold to vendors,
@@ -26,9 +27,16 @@
 --   killers[npcID] = { n, name }; dungeons = { { name, t, s }, ... }; inst = the run in progress
 --   money = { { t, copper }, ... } one every MONEY_GAP seconds while it changes, at most MAX_MONEY
 --   profs[skillLine] = { first, t, rank }; ilvl
---   heat[uiMapID] = { t = { [cell] = seconds }, k = kills, x = kill XP, q = quest XP, d = deaths }
+--   heat[uiMapID] = { t = { [cell] = seconds on the move }, s = seconds standing still, k = kills, x = kill XP,
+--     q = quest XP, d = deaths }
 --   trail[uiMapID] = { point, ... } the walked path, oldest first, at most MAX_TRAIL a zone: a point is
 --     x * 10000 + y + 1 with x, y in hundredths of a percent; 0 breaks the line (a flight, a death, a jump)
+--   routes = { f = { [continent uiMapID] = { point, ... } }, r = the same }: the routes flown on flight
+--     paths (f) and ridden on boats, zeppelins and whatever else carries the character (r), as points on
+--     the continent's map (the trail's format, at most MAX_ROUTE a continent)
+--   jumps = { { map, point, map, point }, ... }: where the character left and arrived when they crossed
+--     the world without travelling it (a portal, a hearthstone, the tram), at most MAX_JUMPS
+--   days also count fl flights, ft seconds in flight, rd rides, rt seconds riding
 --
 -- Kills: Forever's combat log is closed to addons, so a kill is the client's
 -- XP line (CHAT_MSG_COMBAT_XP_GAIN): kills that give no XP are not counted.
@@ -36,11 +44,15 @@
 -- second after), a merchant visit is its net (less the repair bill it paid),
 -- training and flights are what the purse lost across those windows.
 -- Auction house, mail and trades are not followed.
+-- Rides: the client does not say when the character is aboard a boat or a
+-- zeppelin, so a ride is being carried: the position keeps changing by more
+-- than the character's own speed accounts for (as FlowUp's play log does).
 
 local ADDON, ns = ...
 local Compat = ns.Compat
 local L = ns.L
 local type, pairs, ipairs, pcall, tonumber, floor, max, min = type, pairs, ipairs, pcall, tonumber, math.floor, math.max, math.min
+local abs, sqrt = math.abs, math.sqrt
 local remove, sort = table.remove, table.sort
 local readable = Compat.Readable
 
@@ -58,12 +70,23 @@ local MONEY_GAP = 300 -- seconds between purse samples
 local SESSION_GAP = 300 -- a login this long after the last sample is a new session
 local NEAR = 1 -- seconds within which an XP gain belongs to a turn-in, a discovery or a kill line
 local FOE_AGE = 10 -- seconds a foe seen in combat stays the likely killer
-local GRID = 240 -- heat cells a side of a zone map
-local OLD_GRID = 80 -- the grid of a v1 store
+local GRID = 480 -- heat cells a side of a zone map (some 7 yards a cell)
+local OLD_GRIDS = { 80, 240 } -- the grid of a v1 and of a v2 store
 local MAX_TRAIL = 6000 -- path points kept a zone, the oldest dropped first
 local TRAIL_STEP = 0.12 -- percent of the map moved before the next path point
 local TRAIL_JUMP = 4 -- percent in one sample that is no walk (a hearth, a portal): the line breaks
+local STILL = 0.01 -- percent of the map: a sample that moved less than this was standing still
 local ZONE_TYPE = 3 -- Enum.UIMapType.Zone
+local CONTINENT_TYPE = 2 -- Enum.UIMapType.Continent
+local MAX_ROUTE = 6000 -- flight and ride points kept a continent, the oldest dropped first
+local ROUTE_STEP = 0.03 -- percent of the continent's map moved before the next route point (some 10 yards)
+local RIDE_ENTER = 2 -- samples in a row carried before a ride begins
+local RIDE_LEAVE = 4 -- ... and not carried before it ends
+local RIDE_MIN = 6 -- route points a ride needs to be kept: fewer was a lift or a knockback
+local RIDE_SPEED = { 3, 120 } -- yards a second a ride moves at: slower is standing, faster is no ride
+local MAX_JUMPS = 300
+local JUMP_MIN = 300 -- yards between two places that make a jump
+local JUMP_SPEED = 40 -- ... crossed faster than this (yards a second), or unseen
 
 Stats.GRID, Stats.TICK = GRID, TICK
 
@@ -75,17 +98,19 @@ function Stats.Enabled() return ns.Get("stats.enabled") and true or false end
 -- The store
 ---------------------------------------------------------------------------
 
-local TABLES = { "days", "old", "hours", "weekdays", "levels", "quests", "open", "killers", "dungeons", "money", "profs", "heat", "trail" }
+local TABLES = { "days", "old", "hours", "weekdays", "levels", "quests", "open", "killers", "dungeons", "money", "profs", "heat", "trail", "routes", "jumps" }
 
 function Stats.Store()
 	local cs = ns.CharState()
 	local s = cs.stats
 	if type(s) ~= "table" then
-		s = { v = 2 }
+		s = { v = 3 }
 		cs.stats = s
 	end
-	if s.v ~= 2 then
-		-- v1 kept heat on a coarser grid: each cell moves to the cell at its middle.
+	if s.v ~= 3 then
+		-- An older store kept heat on a coarser grid. Twice as coarse (v2): each cell is
+		-- shared out over the four it covers; else (v1) it moves to the cell at its middle.
+		local old = OLD_GRIDS[s.v] or OLD_GRIDS[1]
 		if type(s.heat) == "table" then
 			for _, h in pairs(s.heat) do
 				if type(h) == "table" then
@@ -93,9 +118,18 @@ function Stats.Store()
 						local out = {}
 						if type(cells) == "table" then
 							for cell, n in pairs(cells) do
-								local cx, cy = (cell - 1) % OLD_GRID, floor((cell - 1) / OLD_GRID)
-								local to = Stats.Cell((cx + 0.5) / OLD_GRID * 100, (cy + 0.5) / OLD_GRID * 100)
-								out[to] = (out[to] or 0) + n
+								local cx, cy = (cell - 1) % old, floor((cell - 1) / old)
+								if old * 2 == GRID then
+									for dy = 0, 1 do
+										for dx = 0, 1 do
+											local to = (cy * 2 + dy) * GRID + cx * 2 + dx + 1
+											out[to] = (out[to] or 0) + n / 4
+										end
+									end
+								else
+									local to = Stats.Cell((cx + 0.5) / old * 100, (cy + 0.5) / old * 100)
+									out[to] = (out[to] or 0) + n
+								end
 							end
 						end
 						h[layer] = out
@@ -103,7 +137,7 @@ function Stats.Store()
 				end
 			end
 		end
-		s.v = 2
+		s.v = 3
 	end
 	for _, k in ipairs(TABLES) do if type(s[k]) ~= "table" then s[k] = {} end end
 	if type(s.active) ~= "number" then s.active = 0 end
@@ -114,6 +148,7 @@ end
 function Stats.Reset()
 	ns.CharState().stats = nil
 	if Stats.TrailBreak then Stats.TrailBreak() end
+	if Stats.TravelBreak then Stats.TravelBreak() end
 	ns.Fire("STATS_UPDATED")
 end
 
@@ -147,6 +182,8 @@ end
 local function add(t, key, n)
 	if n and n ~= 0 then t[key] = (t[key] or 0) + n end
 end
+
+local function clock() return GetTime and GetTime() or 0 end
 
 local function number(v)
 	v = readable(v)
@@ -207,6 +244,21 @@ local function place()
 end
 Stats.Place = place
 
+-- A place on a map (percent) as one number: the trail's and the routes' points.
+local function pointOf(x, y)
+	return min(9999, max(0, floor(x * 100))) * 10000 + min(9999, max(0, floor(y * 100))) + 1
+end
+
+-- Adds a point to a capped list, after a break when it does not join the last.
+local function addPoint(list, x, y, joined, cap)
+	if not joined and #list > 0 and list[#list] ~= 0 then list[#list + 1] = 0 end
+	list[#list + 1] = pointOf(x, y)
+	if #list > cap + 200 then
+		local drop, n = #list - cap, #list
+		for i = 1, n do list[i] = list[i + drop] end
+	end
+end
+
 -- The walked path: a point when the player has moved far enough, a break
 -- where the line must not join (off the ground, a jump, another zone).
 local lastMap, lastX, lastY
@@ -231,13 +283,8 @@ local function trail(s)
 		list = {}
 		s.trail[map] = list
 	end
-	if not joined and #list > 0 and list[#list] ~= 0 then list[#list + 1] = 0 end
-	list[#list + 1] = min(9999, max(0, floor(x * 100))) * 10000 + min(9999, max(0, floor(y * 100))) + 1
+	addPoint(list, x, y, joined, MAX_TRAIL)
 	lastMap, lastX, lastY = map, x, y
-	if #list > MAX_TRAIL + 200 then
-		local drop, n = #list - MAX_TRAIL, #list
-		for i = 1, n do list[i] = list[i + drop] end
-	end
 end
 
 function Stats.Trail(map)
@@ -250,6 +297,213 @@ function Stats.TrailXY(point)
 	point = point - 1
 	return floor(point / 10000) / 100, (point % 10000) / 100
 end
+
+---------------------------------------------------------------------------
+-- Travel: flights, rides and jumps, on the continent's map
+---------------------------------------------------------------------------
+
+-- The continent the player is on, their place on its map (percent) and in
+-- the world (yards; nil when the client does not convert); nil where the
+-- client gives no position (an instance, a loading screen).
+local function continentPlace()
+	local M = C_Map
+	if not (M and M.GetBestMapForUnit and M.GetMapInfo and M.GetPlayerMapPosition) then return nil end
+	local ok, at = pcall(M.GetBestMapForUnit, "player")
+	at = ok and number(at) or nil
+	local cont
+	for _ = 1, 8 do
+		if not at then break end
+		local ok2, info = pcall(M.GetMapInfo, at)
+		if not (ok2 and type(info) == "table") then break end
+		if info.mapType == CONTINENT_TYPE then
+			cont = at
+			break
+		end
+		local up = info.parentMapID
+		if type(up) ~= "number" or up == 0 or up == at then break end
+		at = up
+	end
+	if not cont then return nil end
+	local ok3, pos = pcall(M.GetPlayerMapPosition, cont, "player")
+	if not (ok3 and type(pos) == "table") then return nil end
+	local x, y
+	if pos.GetXY then x, y = pos:GetXY() else x, y = pos.x, pos.y end
+	x, y = number(x), number(y)
+	if not (x and y) or (x == 0 and y == 0) then return nil end
+	local wx, wy
+	if M.GetWorldPosFromMapPos then
+		local ok4, _, world = pcall(M.GetWorldPosFromMapPos, cont, pos)
+		if ok4 and type(world) == "table" then
+			if world.GetXY then wx, wy = world:GetXY() else wx, wy = world.x, world.y end
+			wx, wy = number(wx), number(wy)
+		end
+	end
+	return cont, x * 100, y * 100, wx, wy
+end
+
+local function routeList(s, kind, map)
+	local set = s.routes[kind]
+	if type(set) ~= "table" then
+		set = {}
+		s.routes[kind] = set
+	end
+	local list = set[map]
+	if type(list) ~= "table" then
+		list = {}
+		set[map] = list
+	end
+	return list
+end
+
+function Stats.Routes(kind)
+	local set = Stats.Store().routes[kind]
+	return type(set) == "table" and set or {}
+end
+
+function Stats.Jumps() return Stats.Store().jumps end
+
+-- A flight path's route: a point every ROUTE_STEP of the continent's map
+-- while on the taxi. -> whether the character is flying
+local flight = { on = false }
+
+local function sampleFlight(s, dt, map, x, y)
+	if not Compat.IsOnTaxi() then
+		flight.on, flight.map = false, nil
+		return false
+	end
+	local d = today(s)
+	if not flight.on then
+		flight.on = true
+		add(d, "fl", 1)
+	end
+	add(d, "ft", dt)
+	if not map then return true end
+	local joined = flight.map == map
+	if joined and abs(x - flight.x) + abs(y - flight.y) < ROUTE_STEP then return true end
+	addPoint(routeList(s, "f", map), x, y, joined, MAX_ROUTE)
+	flight.map, flight.x, flight.y = map, x, y
+	return true
+end
+
+-- A ride. Its first points wait (ride.held) until there are RIDE_MIN of them
+-- or it reaches another continent: only then is it a ride, counted and kept.
+local ride = { on = false, lead = 0, idle = 0, held = {}, kept = false }
+
+local function endRide()
+	ride.on, ride.lead, ride.idle, ride.kept, ride.map = false, 0, 0, false, nil
+	for i = #ride.held, 1, -1 do ride.held[i] = nil end
+end
+
+local function ridePoint(s, map, x, y)
+	local joined = ride.map == map
+	if joined and abs(x - ride.x) + abs(y - ride.y) < ROUTE_STEP then return end
+	if not ride.kept then
+		local held = ride.held
+		held[#held + 1] = { map, x, y }
+		if #held < RIDE_MIN and held[1][1] == map then
+			ride.map, ride.x, ride.y = map, x, y
+			return
+		end
+		ride.kept = true
+		add(today(s), "rd", 1)
+		local before
+		for i = 1, #held - 1 do
+			local h = held[i]
+			addPoint(routeList(s, "r", h[1]), h[2], h[3], before == h[1], MAX_ROUTE)
+			before = h[1]
+		end
+	end
+	addPoint(routeList(s, "r", map), x, y, joined, MAX_ROUTE)
+	ride.map, ride.x, ride.y = map, x, y
+end
+
+-- -> whether the character is being carried (the walked path stops for it)
+local function sampleRide(s, dt, map, x, y, wx, wy)
+	if not map then return ride.on end -- a loading screen between continents: the ride carries on after it
+	local now = clock()
+	local pm, pwx, pwy, pt = ride.pm, ride.pwx, ride.pwy, ride.pt
+	ride.pm, ride.pwx, ride.pwy, ride.pt = map, wx, wy, now
+	if not pm then return ride.on end
+	local carried = false
+	if pm ~= map then
+		carried = ride.on -- arriving on another continent: only a ride does that gradually
+	elseif wx and pwx and GetUnitSpeed then
+		local ok, own = pcall(GetUnitSpeed, "player")
+		own = ok and number(own) or nil
+		if own then
+			local span = max(0.2, now - pt)
+			local dx, dy = wx - pwx, wy - pwy
+			local moved = sqrt(dx * dx + dy * dy) / span
+			carried = moved > RIDE_SPEED[1] and moved > own * 1.5 + 2 and moved < RIDE_SPEED[2]
+		end
+	end
+	if ride.on then
+		if carried then ride.idle = 0 else ride.idle = ride.idle + 1 end
+		if ride.idle >= RIDE_LEAVE then
+			endRide()
+		else
+			ridePoint(s, map, x, y)
+			if ride.kept then add(today(s), "rt", dt) end
+		end
+	elseif carried then
+		ride.lead = ride.lead + 1
+		if ride.lead >= RIDE_ENTER then
+			ride.on, ride.idle = true, 0
+			ridePoint(s, map, x, y)
+		end
+	else
+		ride.lead = 0
+	end
+	return ride.on
+end
+
+local stillMap, stillX, stillY -- where the last sample was, for standing() (below)
+
+-- A jump: the character was last seen in one place and is now in another,
+-- too far to have walked there since (a portal, a hearthstone, the tram:
+-- anything the client shows no journey for). `travelling`: on a flight, a
+-- ride or dead, where the next place seen is no jump.
+local seen = {}
+
+local function sampleJump(s, travelling, map, x, y, wx, wy)
+	if travelling then
+		seen.map = nil
+		return
+	end
+	if not map then
+		if seen.map then seen.gap = true end
+		return
+	end
+	local now = clock()
+	if seen.map then
+		local far, fast = true, true
+		if seen.map == map and wx and seen.wx then
+			local dx, dy = wx - seen.wx, wy - seen.wy
+			local d = sqrt(dx * dx + dy * dy)
+			far = d > JUMP_MIN
+			fast = seen.gap or d / max(0.2, now - seen.t) > JUMP_SPEED
+		elseif seen.map == map then
+			-- No yards here: a twentieth of the continent's map is far.
+			far = abs(x - seen.x) + abs(y - seen.y) > 5
+			fast = seen.gap or now - seen.t <= MAX_DT * 2
+		end
+		if far and fast then
+			local list = s.jumps
+			list[#list + 1] = { seen.map, pointOf(seen.x, seen.y), map, pointOf(x, y) }
+			while #list > MAX_JUMPS do remove(list, 1) end
+		end
+	end
+	seen.map, seen.x, seen.y, seen.wx, seen.wy, seen.t, seen.gap = map, x, y, wx, wy, now, false
+end
+
+local function travelBreak()
+	stillMap = nil
+	flight.on, flight.map = false, nil
+	endRide()
+	ride.pm, seen.map = nil, nil
+end
+
+Stats.TravelBreak = travelBreak
 
 local function heat(s, layer, n)
 	if not n or n == 0 then return end
@@ -278,7 +532,11 @@ function Stats.HeatMaps()
 	local out = {}
 	for map, h in pairs(Stats.Store().heat) do
 		local seconds = 0
-		if type(h) == "table" and type(h.t) == "table" then for _, v in pairs(h.t) do seconds = seconds + v end end
+		if type(h) == "table" then
+			-- (on the move and standing still: all the time there)
+			if type(h.t) == "table" then for _, v in pairs(h.t) do seconds = seconds + v end end
+			if type(h.s) == "table" then for _, v in pairs(h.s) do seconds = seconds + v end end
+		end
 		out[#out + 1] = { map = map, seconds = seconds }
 	end
 	sort(out, function(a, b)
@@ -379,6 +637,15 @@ local function instance(s)
 	end
 end
 
+-- Whether the player is where the last sample left them (the first sample
+-- of a stay counts as moving: they came here).
+local function standing()
+	local map, _, x, y = place()
+	local still = map ~= nil and map == stillMap and abs(x - stillX) + abs(y - stillY) < STILL
+	stillMap, stillX, stillY = map, x, y
+	return still
+end
+
 local lastTick
 
 function Stats.Tick(dt)
@@ -414,9 +681,21 @@ function Stats.Tick(dt)
 	if flag(IsMounted) then add(d, "m", dt) end
 	if flag(UnitIsAFK, "player") then add(d, "a", dt) end
 	if flag(IsResting) then add(d, "r", dt) end
-	if not Compat.IsOnTaxi() and not flag(UnitIsDeadOrGhost, "player") then
-		heat(s, "t", dt)
-		trail(s)
+	local cont, cx, cy, wx, wy = continentPlace()
+	local flying = sampleFlight(s, dt, cont, cx, cy)
+	local dead = flag(UnitIsDeadOrGhost, "player")
+	local riding = false
+	if flying or dead then
+		endRide()
+		ride.pm = nil
+	else
+		riding = sampleRide(s, dt, cont, cx, cy, wx, wy)
+	end
+	sampleJump(s, flying or dead or riding, cont, cx, cy, wx, wy)
+	if not flying and not dead then
+		-- Time spent somewhere is time on the move there; standing still is kept apart.
+		heat(s, standing() and "s" or "t", dt)
+		if riding then trailBreak() else trail(s) end
 	else
 		trailBreak()
 	end
@@ -433,7 +712,6 @@ local lootOpen, lootUntil = false, 0
 local vendor, trainerMoney, taxiMoney
 local turned = {} -- questID -> true: handed in this session (its QUEST_REMOVED is not an abandon)
 
-local function clock() return GetTime and GetTime() or 0 end
 
 local function readXP()
 	local lvl = number(UnitLevel and UnitLevel("player"))
@@ -659,7 +937,7 @@ local function onSkills() profsDirty = true end
 -- Reading
 ---------------------------------------------------------------------------
 
-local FIELDS = { "p", "c", "f", "m", "a", "r", "xt", "xq", "xe", "k", "d", "b", "qa", "qt", "qr", "il", "iq", "iv", "st", "sb", "sr", "sx" }
+local FIELDS = { "p", "c", "f", "m", "a", "r", "xt", "xq", "xe", "k", "d", "b", "qa", "qt", "qr", "il", "iq", "iv", "st", "sb", "sr", "sx", "fl", "ft", "rd", "rt" }
 
 -- Totals over every day (and the days summed away), with the lists the pages
 -- draw. Reads only; never makes today's row.
@@ -685,6 +963,7 @@ function Stats.Summary()
 		accepted = t.qa, turned = t.qt, abandoned = t.qr,
 		income = { loot = t.il, quests = t.iq, vendor = t.iv },
 		spent = { trainer = t.st, buy = t.sb, repair = t.sr, taxi = t.sx },
+		flights = t.fl, flightSeconds = t.ft, rides = t.rd, rideSeconds = t.rt,
 		days = nDays, sessions = s.sessions, since = s.since,
 		questSeconds = questSeconds, timedQuests = timed,
 		hours = s.hours, weekdays = s.weekdays,
@@ -740,6 +1019,7 @@ local function stop()
 	if ticker and ticker.Cancel then ticker:Cancel() end
 	ticker = nil
 	trailBreak()
+	travelBreak()
 	xpLevel, xpCur, xpMax, vendor, trainerMoney, taxiMoney, pendingGain = nil, nil, nil, nil, nil, nil, nil
 end
 

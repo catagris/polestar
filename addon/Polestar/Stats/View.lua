@@ -1,12 +1,19 @@
 -- The Stats section of the hub: what this character has done, from the
 -- totals Collect.lua keeps. The sidebar lists the pages (Activity,
--- Character, Time, Gold, Professions) and, under a rule, the zones played
--- in, the longest stayed in first: picking a zone shows its heat map on the
--- zone's own map art (UI/ZoneArt.lua: the client's textures, none shipped),
--- with a tab per layer: the walked path as thin lines, then heat cells for
--- time spent, kills, XP from kills, XP from quests and deaths. The mouse
--- wheel over the map zooms in on the cursor (to MAX_ZOOM), dragging moves
--- it, a right-click shows the whole zone again.
+-- Character, Time, Gold, Professions) and, under a rule, the world map (and
+-- any zone played in that is not on it, the longest stayed in first). The world map is one
+-- canvas of every zone (Stats/WorldArt.lua: the world's art, the continents'
+-- and then the zones' as the view closes in; the client's textures, none
+-- shipped) with a tab per layer: the walked path as thin lines, then heat
+-- cells for time spent, kills, XP from kills, XP from quests and deaths,
+-- and the journeys across it: the flight paths flown, then the boats and
+-- zeppelins ridden with the jumps (a portal, a hearthstone, the tram).
+-- A zone the client cannot place on the world (or every zone, on a client
+-- that places none) keeps a page of its own on the zone's map art
+-- (UI/ZoneArt.lua); SV.OnNav("map:<id>") of a zone that is on the world
+-- opens the world map framed on it. The mouse wheel over the
+-- map zooms in on the cursor, dragging moves it, a right-click goes back to
+-- where it opened: the zones played in, or the whole zone.
 --
 --   SV.Zoom(steps[, px, py]), SV.Pan(dx, dy), SV.ResetView(): the same, in
 --   frame pixels (the scripts on the map call them; tests too).
@@ -19,20 +26,33 @@ local UI, Theme, W = ns.UI, ns.Theme, ns.Widgets
 local Stats = ns.Stats
 local Compat = ns.Compat
 local L = ns.L
-local max, min, floor, sqrt, ipairs, pairs, format, tostring, tonumber = math.max, math.min, math.floor, math.sqrt, ipairs, pairs, string.format, tostring, tonumber
+local max, min, floor, ceil, sqrt, ipairs, pairs, format, tostring, tonumber = math.max, math.min, math.floor, math.ceil, math.sqrt, ipairs, pairs, string.format, tostring, tonumber
 local sort = table.sort
 
 if not (UI and W and W.SHELL and Stats and Stats.Charts) then return end
 
 local C = Stats.Charts
+local WA = Stats.WorldArt -- nil without the zone art; its Rect places nothing on a client that cannot
 local SH = W.SHELL
 local DOT = "  \194\183  "
 local MAX_ZONES = 30 -- zones listed in the sidebar
 local MAX_CELLS = 4000 -- heat cells drawn in the frame, the strongest first
 local MAX_LINES = 4000 -- path segments drawn in the frame, the newest first
-local MAX_ZOOM = 12 -- how far in the map goes (1 = the whole zone)
+local MAX_ZOOM = 12 -- how far in a zone's map goes (1 = the whole zone); the world's goes as far into its smallest zone
 local ZOOM_STEP = 1.25 -- one wheel click
-local MAP_RATIO = 2 / 3 -- a zone map's height over its width
+local FIT = 0.9 -- how much of the frame a framed zone (or the zones played in) fills
+local MIN_CELL = 2.5 -- heat cells smaller than this many pixels are summed into blocks
+local MAX_BLOCK = 32 -- ... of at most this many cells a side
+local BLOB = 3.2 -- a heat blob's width in cells (or blocks): wide enough to run into its neighbours
+local MIN_BLOB = 9 -- ... and never under this many pixels
+local TRAIL_PX = 3 -- path steps shorter than this many pixels are joined (a shorter line does not show)
+local FAR_W = 220 -- a zone narrower than this many pixels shows its path as dots: its lines would be too short to see
+local DOT_PX = 2 -- ... this many pixels each
+local MAX_JUMP_LINES = 300 -- jumps drawn in the frame
+local WORLD_KEY = "world"
+local MAP_RATIO = 2 / 3 -- a map's height over its width (the frame's too, where the window has the room)
+local MAP_MIN_H = 160 -- the frame is never shorter than this, however small the window
+local MAP_BELOW = 70 -- room kept under the frame for the scale and a line of notes
 
 local SV = {}
 UI.StatsSection = SV
@@ -48,13 +68,43 @@ local PAGES = {
 	{ key = "professions", label = L["Professions"] },
 }
 
+-- The marks' colours are their own, not the theme's: they have to stand out
+-- on the map art, which is brown and green whatever the look. The art is
+-- drawn with some of its colour out (MAP_DESAT).
+local MAP_DESAT = 0.6
+local PATH_COLOR = { 0.25, 0.95, 1.00 } -- the walked path: bright cyan
+local JUMP_COLOR = { 1, 1, 1 }
+-- Heat, from the least to the most: violet, blue, cyan, green, yellow, orange, red.
+local RAMP = {
+	{ 0.36, 0.20, 0.85 }, { 0.13, 0.47, 1.00 }, { 0.05, 0.85, 0.92 }, { 0.40, 0.95, 0.25 },
+	{ 1.00, 0.92, 0.15 }, { 1.00, 0.52, 0.05 }, { 1.00, 0.12, 0.12 },
+}
+-- How a heat cell's value is shared out when drawn: { column, row, share }.
+local SPLAT = {
+	{ 0, 0, 0.4 }, { 1, 0, 0.1 }, { -1, 0, 0.1 }, { 0, 1, 0.1 }, { 0, -1, 0.1 },
+	{ 1, 1, 0.05 }, { 1, -1, 0.05 }, { -1, 1, 0.05 }, { -1, -1, 0.05 },
+}
+local PEAK_SHARE = 0.02 -- the hottest colour is reached by this share of a zone's cells, not by its one busiest
+local HEAT_ALPHA = 0.2 -- every blob's opacity, the same for all: only the colour says how hot (the map shows through)
+local SHADES = 32 -- the ramp's steps a cell is coloured in
+local HEAT = {} -- [1..SHADES] = { r, g, b }
+for i = 1, SHADES do
+	local t = (i - 1) / (SHADES - 1) * (#RAMP - 1)
+	local k = min(#RAMP - 1, floor(t) + 1)
+	local a, b, f = RAMP[k], RAMP[k + 1], t - (k - 1)
+	HEAT[i] = { a[1] + (b[1] - a[1]) * f, a[2] + (b[2] - a[2]) * f, a[3] + (b[3] - a[3]) * f }
+end
+
 local LAYERS = {
 	{ key = "p", label = L["Path"], unit = L["%s path points"] },
-	{ key = "t", label = L["Time spent"], unit = L["%s here"] },
+	{ key = "t", label = L["Time spent"], unit = L["%s on the move here"] },
 	{ key = "k", label = L["Kills"], unit = L["%s kills"] },
 	{ key = "x", label = L["XP from kills"], unit = L["%s XP"] },
 	{ key = "q", label = L["XP from quests"], unit = L["%s XP"] },
-	{ key = "d", label = L["Deaths"], unit = L["%s deaths"], color = "danger" },
+	{ key = "d", label = L["Deaths"], unit = L["%s deaths"] },
+	-- Journeys across the world: on the world map only (they are kept on the continents' maps).
+	{ key = "f", label = L["Flights"], route = true, color = { 1.00, 0.45, 0.95 } },
+	{ key = "r", label = L["Rides and portals"], route = true, color = { 1.00, 0.78, 0.20 } },
 }
 
 local DAY_NAMES = { [0] = L["Sun"], L["Mon"], L["Tue"], L["Wed"], L["Thu"], L["Fri"], L["Sat"] }
@@ -154,8 +204,12 @@ function pages.character(p, w, a)
 	local class = UI.ClassName and UI.ClassName(info.class) or tostring(info.class or "")
 	local race = UI.RaceName and UI.RaceName(info.race) or tostring(info.race or "")
 	local level = Compat.Readable(UnitLevel and UnitLevel("player")) or 0
+	-- The character's name, under its race and class.
+	local name = Compat.UnitFullName and Compat.UnitFullName("player") or info.name
+	if type(name) ~= "string" or name == "" then name = L["Character"] end
+	shown.name = name
 	local y = C.Cards(p, 0, w, {
-		{ L["Character"], race .. DOT .. class }, { L["Level"], num(level) },
+		{ race .. " " .. class, name }, { L["Level"], num(level) },
 		{ L["Item level"], a.ilvl and num(a.ilvl) or "\226\128\148" },
 	})
 	y = C.Cards(p, y, w, {
@@ -291,11 +345,14 @@ function pages.professions(p, w, a)
 end
 
 ---------------------------------------------------------------------------
--- The zone heat map
+-- The map: the world on one canvas, or one zone's own map
 ---------------------------------------------------------------------------
 
-local function layerOf(key)
-	for _, l in ipairs(LAYERS) do if l.key == key then return l end end
+-- The layer picked; a journey layer only on the world map.
+local function layerOf(key, world)
+	for _, l in ipairs(LAYERS) do
+		if l.key == key and (world or not l.route) then return l end
+	end
 	return LAYERS[1]
 end
 
@@ -303,16 +360,273 @@ local function hideMap()
 	if mapArt then mapArt:Hide() end
 end
 
--- The view of the map in sight: how far in, and the map percent at the
--- middle of the frame. A new zone starts at the whole map.
+-- Whether a zone lies on the world map (it is drawn there, not on a page of its own).
+local function onWorld(map)
+	return WA ~= nil and WA.Rect(map) ~= nil
+end
+
+-- The zones played in that lie on the world map.
+local function worldZones()
+	local out = {}
+	if not WA then return out end
+	for _, z in ipairs(Stats.HeatMaps()) do
+		if onWorld(z.map) then out[#out + 1] = z.map end
+	end
+	return out
+end
+
+-- The view of the map in sight: how far in, and the percent of the canvas
+-- (the world, or the zone's map) at the middle of the frame.
 local view = { zoom = 1, fx = 50, fy = 50 }
-local drawn -- what the map shows: { map, layer, list (heat cells, strongest first), points (path) }
+-- What the map shows: { key ("world" or the uiMapID), world, layer, zones, jumps, bounds, maxZoom, canvas };
+-- a zone of it (a continent, for a journey layer): { map, l, r, t, b (on the canvas, 0..1), points (a
+-- path or route) or cells (heat), agg }; a jump: { x1, y1, x2, y2 } on the canvas (0..1)
+local drawn
+local focusOn -- a zone to frame on the world's next draw (picked in the sidebar)
+
+local function maxZoom() return drawn and drawn.maxZoom or MAX_ZOOM end
+
+-- How much of the canvas the frame shows each way at zoom 1 (0..1): all of
+-- it across; less down when the frame is flatter than the map, which then
+-- fills its width (the art covers the frame).
+local function reach()
+	if not mapArt then return 1, 1 end
+	local mw, mh = mapArt.psW, mapArt.psH
+	local cw = max(mw, mh / MAP_RATIO)
+	return mw / cw, min(1, mh / floor(cw * MAP_RATIO)) -- (the frame's height is a whole number of pixels)
+end
 
 local function clampView()
-	view.zoom = max(1, min(MAX_ZOOM, view.zoom))
-	local half = 50 / view.zoom -- the frame shows 100 / zoom percent of the map
-	view.fx = max(half, min(100 - half, view.fx))
-	view.fy = max(half, min(100 - half, view.fy))
+	view.zoom = max(1, min(maxZoom(), view.zoom))
+	local rx, ry = reach()
+	local hx, hy = 50 * rx / view.zoom, 50 * ry / view.zoom -- half of what the frame shows, percent of the canvas
+	view.fx = max(hx, min(100 - hx, view.fx))
+	view.fy = max(hy, min(100 - hy, view.fy))
+end
+
+-- Frames a rectangle of the canvas (0..1), with a little room around it.
+local function fitView(l, r, t, b)
+	local rx, ry = reach()
+	view.zoom = max(1, FIT * min(rx / (r - l), ry / (b - t)))
+	view.fx, view.fy = (l + r) * 50, (t + b) * 50
+end
+
+-- The view a map opens on: the whole zone, or the part of the world played in.
+local function homeView()
+	local b = drawn and drawn.bounds
+	if b then fitView(b[1], b[2], b[3], b[4]) else view.zoom, view.fx, view.fy = 1, 50, 50 end
+end
+
+local function stronger(x, z)
+	if x[2] ~= z[2] then return x[2] > z[2] end
+	return x[1] < z[1]
+end
+
+-- A zone's heat with each cell's value spread over the cell and the eight
+-- around it (SPLAT), so the grid reads as heat and not as specks in rows:
+-- { [row * GRID + column, from 0] = value }. What would fall off the zone's
+-- map is left out. Made once a zone.
+local function spread(z)
+	local out = z.spread
+	if out then return out end
+	out = {}
+	local G = Stats.GRID
+	for cell, v in pairs(z.cells) do
+		local c = cell - 1
+		local cx, cy = c % G, floor(c / G)
+		for i = 1, #SPLAT do
+			local k = SPLAT[i]
+			local x, y = cx + k[1], cy + k[2]
+			if x >= 0 and x < G and y >= 0 and y < G then
+				local key = y * G + x
+				out[key] = (out[key] or 0) + v * k[3]
+			end
+		end
+	end
+	z.spread = out
+	return out
+end
+
+-- A zone's heat in blocks of f x f cells, the strongest first: { { block, sum }, ... },
+-- block = row * (GRID / f) + column, from 0; list.peak: the value that counts as
+-- full strength (PEAK_SHARE). Kept per zone and f.
+local function blocks(z, f)
+	local list = z.agg[f]
+	if list then return list end
+	local G = Stats.GRID
+	local per = ceil(G / f)
+	local sum = {}
+	for c, v in pairs(spread(z)) do
+		local key = floor(floor(c / G) / f) * per + floor((c % G) / f)
+		sum[key] = (sum[key] or 0) + v
+	end
+	list = {}
+	for key, v in pairs(sum) do list[#list + 1] = { key, v } end
+	sort(list, stronger)
+	-- A high percentile, not the most: one spot where the character sat for an
+	-- hour does not wash out everything else.
+	local top = list[max(1, ceil(#list * PEAK_SHARE))]
+	list.peak = top and top[2] or 0
+	z.agg[f] = list
+	return list
+end
+
+-- How many cells a side go into one block for a zone `wide` frame pixels
+-- across: far out, cells too small to see are summed into ones that show.
+local function blockSize(wide)
+	local px, f = wide / Stats.GRID, 1
+	while px * f < MIN_CELL and f < MAX_BLOCK do f = f * 2 end
+	return f
+end
+
+local picked = {} -- the heat cells of a zone being drawn: { x, y, value }, reused
+
+-- Where a zone's path went, on a grid of n cells a side: the cells it
+-- touched, the newest first ({ row * n + column, from 0 }). Kept for the n
+-- last asked for (it changes with the zoom, not as the map is dragged).
+local function dots(z, n)
+	local d = z.dots
+	if d and d.n == n then return d end
+	local pts, seen = z.points, {}
+	d = { n = n }
+	for i = #pts, 1, -1 do
+		local x, y = Stats.TrailXY(pts[i])
+		if x then
+			local key = min(n - 1, floor(y / 100 * n)) * n + min(n - 1, floor(x / 100 * n))
+			if not seen[key] then
+				seen[key] = true
+				d[#d + 1] = key
+			end
+		end
+	end
+	z.dots = d
+	return d
+end
+
+-- The layer's marks for the canvas `cv`, over the zones in the frame.
+local function paintMarks(cv, mw, mh)
+	C.Reset(mapPool)
+	local layer = drawn.layer
+	local color = layer.color or PATH_COLOR
+	local vis = {}
+	for _, z in ipairs(drawn.zones) do
+		local x, y = cv[1] + z.l * cv[3], cv[2] + z.t * cv[4]
+		local w, h = (z.r - z.l) * cv[3], (z.b - z.t) * cv[4]
+		if x < mw and y < mh and x + w > 0 and y + h > 0 then
+			z.x, z.y, z.w, z.h = x, y, w, h
+			vis[#vis + 1] = z
+		end
+	end
+	local n = 0
+	-- Jumps (a portal, a hearthstone, the tram): a faint straight line from where to where.
+	for _, j in ipairs(drawn.jumps or {}) do
+		if n >= MAX_JUMP_LINES then break end
+		local x1, y1 = cv[1] + j[1] * cv[3], cv[2] + j[2] * cv[4]
+		local x2, y2 = cv[1] + j[3] * cv[3], cv[2] + j[4] * cv[4]
+		if not ((x1 < 0 and x2 < 0) or (x1 > mw and x2 > mw) or (y1 < 0 and y2 < 0) or (y1 > mh and y2 > mh)) then
+			n = n + 1
+			C.Segment(mapPool, x1, y1, x2, y2, JUMP_COLOR, 1.5, 0.7)
+		end
+	end
+	shown.jumps = n
+	if #vis == 0 then return n, 0 end
+	if layer.key == "p" or layer.route then
+		local share = floor(MAX_LINES / #vis)
+		for _, z in ipairs(vis) do
+			local pts = z.points
+			-- As thick as the zone is zoomed: a hairline from afar (a journey's: as its continent is).
+			local thick = min(3, max(1.5, 1.5 + (z.w / mw - 1) * 0.15))
+			if layer.route then thick = min(3, max(2, 1.5 + z.w / mw * 0.05)) end
+			local kx, ky = z.w / 100, z.h / 100
+			local px, py
+			local k = 0
+			local from = #pts
+			if z.w < FAR_W then
+				-- From afar: a dot wherever the path went, the lines being too short to show.
+				local per = max(1, floor(z.w / DOT_PX))
+				local d = dots(z, per)
+				local cw, ch = z.w / per, z.h / per
+				for i = 1, #d do
+					if k >= share then break end
+					local key = d[i]
+					local x, y = z.x + (key % per) * cw, z.y + floor(key / per) * ch
+					if x < mw and y < mh and x + DOT_PX > 0 and y + DOT_PX > 0 then
+						k = k + 1
+						C.Rect(mapPool, "ARTWORK", x, y, DOT_PX, DOT_PX, color)
+					end
+				end
+				from = 0
+			end
+			-- Newest first, so a long history gives way to the latest walks.
+			for i = from, 1, -1 do
+				local tx, ty = Stats.TrailXY(pts[i])
+				if not tx then
+					px, py = nil, nil
+				else
+					local x, y = z.x + tx * kx, z.y + ty * ky
+					if not px then
+						px, py = x, y
+					elseif math.abs(x - px) + math.abs(y - py) >= TRAIL_PX then
+						-- (a step too short to see is left for the next point to span)
+						if k < share and not ((x < 0 and px < 0) or (x > mw and px > mw) or (y < 0 and py < 0) or (y > mh and py > mh)) then
+							k = k + 1
+							C.Segment(mapPool, px, py, x, y, color, thick, 1)
+						end
+						px, py = x, y
+					end
+				end
+			end
+			n = n + k
+		end
+	else
+		local G = Stats.GRID
+		-- One scale for every zone, so a busy zone and a quiet one compare; it
+		-- changes with the zoom (the blocks do), not as the map is dragged.
+		if drawn.peakAt ~= cv[3] then
+			local peak = 0
+			for _, z in ipairs(drawn.zones) do
+				local top = blocks(z, blockSize((z.r - z.l) * cv[3])).peak
+				if top > peak then peak = top end
+			end
+			drawn.peak, drawn.peakAt = peak, cv[3]
+		end
+		local peak = drawn.peak > 0 and drawn.peak or 1
+		local share = floor(MAX_CELLS / #vis)
+		for _, z in ipairs(vis) do
+			local f = blockSize(z.w)
+			local list = blocks(z, f)
+			local per = ceil(G / f)
+			local cw, ch = z.w / per, z.h / per
+			-- Each cell is a soft round blob wider than the cell, so neighbours run together.
+			local size = max(MIN_BLOB, BLOB * max(cw, ch))
+			local half = size / 2
+			-- The strongest in the frame, up to the zone's share ...
+			local k = 0
+			for i = 1, #list do
+				if k >= share then break end
+				local key = list[i][1]
+				local x, y = z.x + (key % per + 0.5) * cw, z.y + (floor(key / per) + 0.5) * ch
+				if x - half < mw and y - half < mh and x + half > 0 and y + half > 0 then
+					k = k + 1
+					local pick = picked[k]
+					if not pick then
+						pick = {}
+						picked[k] = pick
+					end
+					pick[1], pick[2], pick[3] = x, y, list[i][2]
+				end
+			end
+			-- ... drawn the faintest first: the hot spots lie on top.
+			for i = k, 1, -1 do
+				local pick = picked[i]
+				-- The square root lifts the faint cells: one busy spot would hide the rest.
+				local heat = min(1, sqrt(pick[3] / peak))
+				C.Blob(mapPool, pick[1], pick[2], size, HEAT[floor(heat * (SHADES - 1) + 0.5) + 1], HEAT_ALPHA)
+			end
+			n = n + k
+		end
+	end
+	return n, #vis
 end
 
 -- Lays the art and the layer's marks out for the view. Only this runs while
@@ -321,8 +635,14 @@ local function paintMap()
 	if not (mapArt and drawn) then return end
 	local mw, mh = mapArt.psW, mapArt.psH
 	clampView()
-	mapArt.psZoom = view.zoom
-	local painted = UI.ZoneArt and UI.ZoneArt.Paint and UI.ZoneArt.Paint(mapArt, drawn.map, view.fx, view.fy, 1) or false
+	local painted
+	if drawn.world then
+		painted = WA.Paint(mapArt, view.fx, view.fy, view.zoom)
+	else
+		if WA then WA.Clear(mapArt) end
+		mapArt.psZoom = view.zoom
+		painted = UI.ZoneArt and UI.ZoneArt.Paint and UI.ZoneArt.Paint(mapArt, drawn.key, view.fx, view.fy, 1) or false
+	end
 	local cv = mapArt.psCanvas
 	if not cv then
 		-- No art here: the same framing, worked out for a plain panel.
@@ -330,46 +650,11 @@ local function paintMap()
 		cv = { mw / 2 - view.fx / 100 * cw, mh / 2 - view.fy / 100 * ch, cw, ch }
 	end
 	drawn.canvas = cv
-	C.Reset(mapPool)
-	local layer = drawn.layer
-	local color = layer.color or "accent"
-	local n = 0
-	if layer.key == "p" then
-		local pts = drawn.points
-		local thick = min(2.5, 1 + (view.zoom - 1) * 0.15)
-		local px, py
-		-- Newest first, so a long history gives way to the latest walks.
-		for i = #pts, 1, -1 do
-			local tx, ty = Stats.TrailXY(pts[i])
-			if not tx then
-				px, py = nil, nil
-			else
-				local x, y = cv[1] + tx / 100 * cv[3], cv[2] + ty / 100 * cv[4]
-				if px and n < MAX_LINES and not ((x < 0 and px < 0) or (x > mw and px > mw) or (y < 0 and py < 0) or (y > mh and py > mh)) then
-					n = n + 1
-					C.Segment(mapPool, px, py, x, y, color, thick, 0.9)
-				end
-				px, py = x, y
-			end
-		end
-	else
-		local G = Stats.GRID
-		local cw, ch = cv[3] / G, cv[4] / G
-		local list = drawn.list
-		local peak = list[1] and list[1][2] or 1
-		for i = 1, #list do
-			if n >= MAX_CELLS then break end
-			local cell, v = list[i][1] - 1, list[i][2]
-			local x, y = cv[1] + (cell % G) * cw, cv[2] + floor(cell / G) * ch
-			if x < mw and y < mh and x + cw > 0 and y + ch > 0 then
-				n = n + 1
-				-- The square root lifts the faint cells: one busy spot would hide the rest.
-				C.Rect(mapPool, "ARTWORK", x, y, cw + 0.5, ch + 0.5, color, 0.25 + 0.7 * sqrt(v / peak))
-			end
-		end
-	end
+	local n, zones = paintMarks(cv, mw, mh)
 	shown.cells, shown.painted, shown.zoom = n, painted and true or false, view.zoom
 	shown.focus = { view.fx, view.fy }
+	shown.zones, shown.art = zones, drawn.world and mapArt.psWorld or nil
+	shown.size = { mw, mh }
 	return painted
 end
 
@@ -381,7 +666,7 @@ function SV.Zoom(steps, px, py)
 	px, py = px or mw / 2, py or mh / 2
 	local u, v = (px - cv[1]) / cv[3], (py - cv[2]) / cv[4]
 	local was = view.zoom
-	view.zoom = max(1, min(MAX_ZOOM, was * ZOOM_STEP ^ steps))
+	view.zoom = max(1, min(maxZoom(), was * ZOOM_STEP ^ steps))
 	local k = view.zoom / was
 	view.fx = ((mw / 2 - px) / (cv[3] * k) + u) * 100
 	view.fy = ((mh / 2 - py) / (cv[4] * k) + v) * 100
@@ -398,7 +683,7 @@ function SV.Pan(dx, dy)
 end
 
 function SV.ResetView()
-	view.zoom, view.fx, view.fy = 1, 50, 50
+	homeView()
 	paintMap()
 end
 
@@ -438,48 +723,141 @@ local function wireMap(f)
 	end)
 end
 
-local function drawMap(map, w)
-	local layer = layerOf(ns.Get("stats.layer"))
-	local list, points, total = {}, {}, 0
-	if layer.key == "p" then
-		points = Stats.Trail(map) or points
-		for _, pt in ipairs(points) do if pt ~= 0 then total = total + 1 end end
+-- A zone's part of the layer, lying at (l, r, t, b) of the canvas.
+-- -> zone, its total on the layer
+local function zoneMarks(map, layer, l, r, t, b)
+	local z = { map = map, l = l, r = r, t = t, b = b, agg = {} }
+	local total = 0
+	if layer.route then
+		z.points = Stats.Routes(layer.key)[map] or {}
+		for _, pt in ipairs(z.points) do if pt ~= 0 then total = total + 1 end end
+	elseif layer.key == "p" then
+		z.points = Stats.Trail(map) or {}
+		for _, pt in ipairs(z.points) do if pt ~= 0 then total = total + 1 end end
 	else
 		local h = Stats.Heat(map) or {}
-		for cell, v in pairs(h[layer.key] or {}) do
-			list[#list + 1] = { cell, v }
-			total = total + v
-		end
-		sort(list, function(x, z)
-			if x[2] ~= z[2] then return x[2] > z[2] end
-			return x[1] < z[1]
-		end)
+		z.cells = h[layer.key] or {}
+		for _, v in pairs(z.cells) do total = total + v end
 	end
-	local amount = layer.key == "t" and elapsed(total) or num(total)
-	local y = C.Note(pool, 0, w, format(layer.unit, amount) .. DOT .. L["Scroll to zoom, drag to move, right-click for the whole map"])
+	return z, total
+end
 
+-- map: the zone whose own map to draw; nil: the world, with every zone on it.
+local function drawMap(map, w)
+	local world = map == nil
+	local layer = layerOf(ns.Get("stats.layer"), world)
+	local key = world and WORLD_KEY or map
+	local zones, total, bounds, deepest = {}, 0, nil, MAX_ZOOM
+	local jumps
+	if world then
+		WA.Refresh()
+		local narrowest
+		for _, id in ipairs(worldZones()) do
+			WA.Include(id)
+			local l, r, t, b = WA.Rect(id)
+			if not layer.route then
+				local z, n = zoneMarks(id, layer, l, r, t, b)
+				zones[#zones + 1] = z
+				total = total + n
+			end
+			if bounds then
+				bounds[1], bounds[2], bounds[3], bounds[4] = min(bounds[1], l), max(bounds[2], r), min(bounds[3], t), max(bounds[4], b)
+			else
+				bounds = { l, r, t, b }
+			end
+			narrowest = min(narrowest or 1, r - l, b - t)
+		end
+		-- As far into the smallest zone played in as a zone's own map goes.
+		deepest = MAX_ZOOM / (narrowest or 0.05)
+		if layer.route then
+			-- The routes lie on their continents' maps.
+			for id in pairs(Stats.Routes(layer.key)) do
+				local l, r, t, b = WA.Rect(id)
+				if l then
+					local z, n = zoneMarks(id, layer, l, r, t, b)
+					zones[#zones + 1] = z
+					total = total + n
+				end
+			end
+			sort(zones, function(x, z) return x.map < z.map end)
+			if layer.key == "r" then
+				jumps = {}
+				for _, j in ipairs(Stats.Jumps()) do
+					local l1, r1, t1, b1 = WA.Rect(j[1])
+					local l2, r2, t2, b2 = WA.Rect(j[3])
+					local x1, y1 = Stats.TrailXY(j[2])
+					local x2, y2 = Stats.TrailXY(j[4])
+					if l1 and l2 and x1 and x2 then
+						jumps[#jumps + 1] = { l1 + x1 / 100 * (r1 - l1), t1 + y1 / 100 * (b1 - t1), l2 + x2 / 100 * (r2 - l2), t2 + y2 / 100 * (b2 - t2) }
+					end
+				end
+				total = total + #jumps
+			end
+		end
+	else
+		local z, n = zoneMarks(map, layer, 0, 1, 0, 1)
+		zones[1], total = z, n
+	end
+	local hint = world and L["Scroll to zoom, drag to move, right-click for everywhere you have been"]
+		or L["Scroll to zoom, drag to move, right-click for the whole map"]
+	local counted
+	if layer.key == "f" then
+		local a = Stats.Summary()
+		counted = format(L["%s flights"], num(a.flights)) .. DOT .. format(L["%s in the air"], elapsed(a.flightSeconds))
+			.. DOT .. format(L["%s in fares"], ns.MoneyText(a.spent.taxi))
+	elseif layer.key == "r" then
+		local a = Stats.Summary()
+		counted = format(L["%s rides"], num(a.rides)) .. DOT .. format(L["%s aboard"], elapsed(a.rideSeconds))
+			.. DOT .. format(L["%s portals, hearths and trams"], num(jumps and #jumps or 0))
+	else
+		counted = format(layer.unit, layer.key == "t" and elapsed(total) or num(total))
+	end
+	local y = C.Note(pool, 0, w, counted .. DOT .. hint)
+
+	-- As tall as its width asks, or as the window has room for: the page does
+	-- not scroll to show the rest of the map.
 	local mw, mh = w, floor(w * MAP_RATIO)
-	if not mapArt or mapArt.psW ~= mw then
-		if mapArt then mapArt:Hide() end
+	local room = scroll.GetHeight and scroll:GetHeight() or 0
+	if room > 0 then mh = max(MAP_MIN_H, min(mh, floor(room - y - 8 - MAP_BELOW))) end
+	if not mapArt then
 		mapArt = UI.ZoneArt and UI.ZoneArt.Create(scroll.Child, mw, mh, "panel") or CreateFrame("Frame", nil, scroll.Child)
-		mapArt:SetSize(mw, mh)
-		mapArt.psW, mapArt.psH = mw, mh
-		-- The map as it is: no fades, the view's point in the middle.
-		mapArt.psFocusY, mapArt.psDesat = mh / 2, 0.6
+		-- The map as it is: no fades.
+		mapArt.psDesat = MAP_DESAT
 		if mapArt.Fade then mapArt.Fade:Hide() end
 		if mapArt.Top then mapArt.Top:Hide() end
 		mapPool = C.Pool(mapArt.Over or mapArt)
 		wireMap(mapArt)
 	end
+	-- (the view's point in the middle of it)
+	mapArt:SetSize(mw, mh)
+	mapArt.psW, mapArt.psH, mapArt.psFocusY = mw, mh, mh / 2
 	mapArt:ClearAllPoints()
 	mapArt:SetPoint("TOPLEFT", scroll.Child, "TOPLEFT", SH.pad, -(y + 8))
 	mapArt:Show()
-	if not drawn or drawn.map ~= map then view.zoom, view.fx, view.fy = 1, 50, 50 end
-	drawn = { map = map, layer = layer, list = list, points = points }
+	local fresh = not drawn or drawn.key ~= key
+	drawn = { key = key, world = world, layer = layer, zones = zones, jumps = jumps, bounds = bounds, maxZoom = deepest }
+	if fresh then homeView() end
+	if world and focusOn then
+		local l, r, t, b = WA.Rect(focusOn)
+		if l then fitView(l, r, t, b) end
+	end
+	focusOn = nil
 	local painted = paintMap()
 	y = y + 8 + mh + 12
+	if layer.key ~= "p" and not layer.route then
+		-- The heat's scale: its colours from the least to the most.
+		local less = C.Text(pool, "caption", "textMuted", L["Less"], 0, y)
+		local x = floor((less:GetStringWidth() or 28) + 0.5) + 8
+		for i = 1, SHADES do C.Rect(pool, "ARTWORK", x + (i - 1) * 5, y + 2, 5, 8, HEAT[i]) end
+		C.Text(pool, "caption", "textMuted", L["More"], x + SHADES * 5 + 8, y)
+		y = y + 22
+	end
 	if not painted then y = C.Note(pool, y, w, L["This map's art is not available here, so the marks are drawn without it."]) end
-	if total == 0 then
+	if layer.key == "f" then
+		if total == 0 then y = C.Note(pool, y, w, L["No flight drawn yet: a flight path's route is drawn from now on, as you fly it."]) end
+	elseif layer.key == "r" then
+		y = C.Note(pool, y, w, L["A boat, a zeppelin or anything else that carries you is drawn as it went; a portal, a hearthstone or the tram as a straight faint line from where you left to where you arrived. Drawn from now on."])
+	elseif total == 0 then
 		y = C.Note(pool, y, w, layer.key == "p" and L["No path walked here yet: it is drawn from now on, as you move."] or L["Nothing counted on this layer here yet."])
 	end
 	shown.total = total
@@ -505,11 +883,14 @@ function SV.Build(parent, shell)
 	return root
 end
 
--- The page in view: a page key, or "map:<uiMapID>".
+-- The page in view: a page key, "world" (the one map of every zone that
+-- lies on the world map), or "map:<uiMapID>" with the map (a zone that does
+-- not: its own map).
 local function current()
 	local key = ns.Get("stats.page")
 	local map = type(key) == "string" and tonumber(key:match("^map:(%d+)$"))
-	if map then return key, map end
+	if map and not onWorld(map) then return key, map end
+	if (map or key == WORLD_KEY) and #worldZones() > 0 then return WORLD_KEY end
 	for _, pg in ipairs(PAGES) do if pg.key == key then return key end end
 	return PAGES[1].key
 end
@@ -529,12 +910,14 @@ function SV.Render()
 	end
 	C.Reset(pool)
 	local y
-	if map then
-		title = Compat.MapName and Compat.MapName(map) or tostring(map)
+	if map or key == WORLD_KEY then
+		title = map and (Compat.MapName and Compat.MapName(map) or tostring(map)) or L["World map"]
 		if shellRef then
 			local tabs = {}
-			for i, l in ipairs(LAYERS) do tabs[i] = { key = l.key, label = l.label } end
-			W.ShellTabs(shellRef, tabs, layerOf(ns.Get("stats.layer")).key, function(k) SV.SetLayer(k) end)
+			for _, l in ipairs(LAYERS) do
+				if not map or not l.route then tabs[#tabs + 1] = { key = l.key, label = l.label } end
+			end
+			W.ShellTabs(shellRef, tabs, layerOf(ns.Get("stats.layer"), not map).key, function(k) SV.SetLayer(k) end)
 		end
 		y = drawMap(map, w)
 	else
@@ -550,16 +933,23 @@ function SV.Render()
 	shown.fonts, shown.rects, shown.lines = C.Counts(pool)
 end
 
--- The sidebar: the pages, then the zones played in.
+-- The sidebar: the pages, then the world map, and the zones played in that
+-- are not on it (each has a page of its own; on a client that places no zone
+-- on the world, that is every zone).
 function SV.Nav()
 	local out = {}
 	for i, pg in ipairs(PAGES) do out[i] = { key = pg.key, label = pg.label } end
 	local zones = Stats.HeatMaps()
 	if #zones > 0 then out[#out + 1] = { separator = true } end
-	for i = 1, min(#zones, MAX_ZONES) do
-		local z = zones[i]
-		local name = Compat.MapName and Compat.MapName(z.map) or tostring(z.map)
-		out[#out + 1] = { key = "map:" .. z.map, label = name, icon = "icon-explore" }
+	if #worldZones() > 0 then out[#out + 1] = { key = WORLD_KEY, label = L["World map"], icon = "icon-goto" } end
+	local listed = 0
+	for _, z in ipairs(zones) do
+		if listed >= MAX_ZONES then break end
+		if not onWorld(z.map) then
+			listed = listed + 1
+			local name = Compat.MapName and Compat.MapName(z.map) or tostring(z.map)
+			out[#out + 1] = { key = "map:" .. z.map, label = name, icon = "icon-explore" }
+		end
 	end
 	return out, (current())
 end
@@ -570,6 +960,8 @@ local function repaint()
 end
 
 function SV.OnNav(key)
+	local map = type(key) == "string" and tonumber(key:match("^map:(%d+)$"))
+	if map and onWorld(map) then key, focusOn = WORLD_KEY, map end
 	ns.Set("stats.page", key)
 	if scroll then W.ScrollTo(scroll, 0) end
 	repaint()
