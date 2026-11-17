@@ -1,7 +1,8 @@
 -- env: world stub_rares.lua
--- The Discovery page's Rares and Characters tabs (Rares/Options.lua, Detect.lua, Rares.lua, Toast.lua;
--- Alts/Options.lua, Snapshot.lua): a fresh rare (or the founder) comes into view by each path the client offers
--- (rares.rs), and the alert card says so or not; the character's saved entry follows its money or not.
+-- The Discovery page's Rares, Characters and Stats settings (Rares/Options.lua, Detect.lua, Rares.lua, Toast.lua;
+-- Alts/Options.lua, Snapshot.lua; Stats/Options.lua, Collect.lua): a fresh rare (or the founder) comes into view by
+-- each path the client offers (rares.rs), and the alert card says so or not; the character's saved entry follows
+-- its money or not; a sample counts as time played or not.
 local w, R, U, T
 local n = 0 -- rares seen so far: each check meets a new one
 local function card() return PolestarRareToast ~= nil and PolestarRareToast:IsShown() and PolestarRareToast.Name:GetText() or false end
@@ -88,6 +89,12 @@ return {
 			stub.advance(11)
 			local me = Polestar.Alts.List()[1]
 			return me ~= nil and me.money == money
+		end,
+		-- The Stats page's counting (Stats/Collect.lua): a sample adds to the time played, or does not.
+		["stats.enabled"] = function()
+			local before = Polestar.Stats.Summary().played
+			Polestar.Stats.Tick(2)
+			return Polestar.Stats.Summary().played > before
 		end,
 	},
 }
