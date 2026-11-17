@@ -9040,7 +9040,15 @@
 	},
 	"97944": {
 		"set": {
-			"xp": 270
+			"xp": 270,
+			"objectives": [
+				{
+					"type": "event",
+					"id": null,
+					"count": 1,
+					"text": "Raise your herbalism skill to 20"
+				}
+			]
 		},
 		"source": [
 			{
@@ -9050,9 +9058,17 @@
 			{
 				"kind": "questie",
 				"ref": "trace XP table 1.0.13: 270 (player traces, can be 5 off)"
+			},
+			{
+				"kind": "client",
+				"ref": "quest cache, build 1.60.1.70938: the quest's one objective reads 'Raise your herbalism skill to 20'"
+			},
+			{
+				"kind": "in-game-check",
+				"ref": "the maintainer's quest log on a Night Elf, 2026-11-15: the objective line is 'Raise your herbalism skill to 20', and the quest could not be handed in to Malorne Bladeleaf yet"
 			}
 		],
-		"note": "Camping 101: Herbalism rewards 270 XP on Forever, as players' hand-ins at a full-XP level show; the data had 220, which skewed the level model."
+		"note": "Camping 101: Herbalism rewards 270 XP on Forever, as players' hand-ins at a full-XP level show; the data had 220, which skewed the level model. Its objective is to raise Herbalism to 20, not a kill: the merged data had talking to Malorne Bladeleaf, so the guide said to talk to the trainer while the quest could not be handed in yet."
 	},
 	"98298": {
 		"set": {

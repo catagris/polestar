@@ -27,6 +27,13 @@ test('every public correction names an independent source, and its note cites no
 	assert.deepEqual(bad, []);
 });
 
+test("Camping 101: Herbalism's one objective is to raise Herbalism to 20, not to talk to its trainer (the maintainer's check, 2026-11-15)", () => {
+	// Teldrassil's (97944): the client's quest cache and the quest log read "Raise your herbalism skill to 20".
+	const set = corrections.quests['97944'].set;
+	assert.deepEqual(set.objectives, [{ type: 'event', id: null, count: 1, text: 'Raise your herbalism skill to 20' }]);
+	assert.equal(set.xp, 270, 'the recorded XP stays');
+});
+
 test('the corrections are one file per section in forever-db/corrections', () => {
 	for (const s of SECTIONS) assert.ok(fs.existsSync(path.join(PUBLIC_DIR, `${s}.json`)), `${s}.json`);
 	assert.ok(!fs.existsSync(path.join(__dirname, '..', 'tools', 'lib', 'data', 'corrections.json')), 'the old single file is gone');

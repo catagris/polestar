@@ -6828,6 +6828,26 @@
 				}
 			],
 			"issue": 1867
+		},
+		{
+			"id": "camping-101-herbalism-skill-20",
+			"faction": "Alliance",
+			"at": {
+				"quest": 97944,
+				"goal": "complete"
+			},
+			"goalNote": "gather herbs until your Herbalism is 20: Malorne Bladeleaf takes the quest then",
+			"note": "Camping 101: Herbalism (Teldrassil): its objective is to raise Herbalism to 20 (forever-db/corrections quests 97944), so the goal's note 'talk to the trainer' sent players to Malorne Bladeleaf before the quest could be handed in.",
+			"source": [
+				{
+					"kind": "client",
+					"ref": "quest cache, build 1.60.1.70938: quest 97944's one objective reads 'Raise your herbalism skill to 20'"
+				},
+				{
+					"kind": "in-game-check",
+					"ref": "the maintainer's Night Elf, 2026-11-15: sent to Malorne Bladeleaf with the quest in the log; the objective line read 'Raise your herbalism skill to 20' and the quest could not be handed in"
+				}
+			]
 		}
 	]
 }
