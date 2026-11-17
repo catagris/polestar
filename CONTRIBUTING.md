@@ -41,7 +41,8 @@ package them. You can help without touching any code.
 
 The in-game report (the bug in the guide window) fills in most of this for
 you: the guide, the step and its goals, your position, your race, class and
-level, the versions and any errors Polestar caught. Add what is wrong.
+level, the versions, the settings you changed from their defaults and any
+errors Polestar caught. Add what is wrong.
 
 - The guide and the step as the guide window shows them (the guide's title
   and the step's number and text).
@@ -61,15 +62,24 @@ report goes through the same steps before anything changes:
 
 1. **Check the version and install.** The report's first line names the
    Polestar version. Is the step still the same on the coming release?
-2. **Reproduce it.** In the data (`data/forever/*.json`, the compiled guide),
+2. **Rule out a setting they changed.** The report's Settings section, at
+   the end of its details, lists every setting that differs from its
+   default in the profile the player uses (and whether that profile is the
+   character's own, its class's or the account's), the ones that change
+   what Polestar does first, the looks summed up in one line. "Settings:
+   all defaults" rules settings out. A long list ends with "+N more" and a
+   packed line; on an issue filed from Discord the bot unfolds every
+   setting, with its default, under "Settings". Try the step with the
+   settings that could explain it before calling it a bug.
+3. **Reproduce it.** In the data (`data/forever/*.json`, the compiled guide),
    in the test client (`tests/`, see tests/README.md) or in the game. A
    report that can't be reproduced gets an answer saying so, and why.
-3. **Check it against the sources.** The game's own data, Forever's quest
+4. **Check it against the sources.** The game's own data, Forever's quest
    data, recordings. A player's memory of Classic is not a source: Forever
    changed many quests.
-4. **Fix it only if it is real,** with a test that fails before the fix and
+5. **Fix it only if it is real,** with a test that fails before the fix and
    passes after it (or, for a guide, lint and `playtest`).
-5. **Credit the reporter** in the fix's changelog entry, "(thanks <name>)",
+6. **Credit the reporter** in the fix's changelog entry, "(thanks <name>)",
    and tell them which release carries the fix.
 
 ## Before you start
@@ -243,11 +253,12 @@ A few tests skip automatically when the reference data (`data/forever`) or
 Lua 5.1 is missing. [tests/README.md](tests/README.md) describes the suite;
 [docs/SUITE.md](docs/SUITE.md) what is in and out of scope.
 
-**You do not commit** `addon/Polestar_Guides/Guides.lua`, `docs/preview/*.svg`,
-the locale files in `addon/Polestar*/`, or `addon/Polestar/Media/*.tga` unless
-your change is to the generator itself (a texture generator in `tools/media/`,
-the preview renderer in `tools/preview/`, or the compiler in `tools/lib/dsl/`).
-The maintainer regenerates those after merging your PR.
+**You do not commit** `addon/Polestar_Guides/Guides.lua`, `addon/Polestar_Experimental/`
+(compiled from `experimental/`), `docs/preview/*.svg`, the locale files in
+`addon/Polestar*/`, or `addon/Polestar/Media/*.tga` unless your change is to
+the generator itself (a texture generator in `tools/media/`, the preview
+renderer in `tools/preview/`, or the compiler in `tools/lib/dsl/`). The
+maintainer regenerates those after merging your PR.
 
 ## Code changes
 
@@ -279,14 +290,27 @@ The maintainer regenerates those after merging your PR.
 | Branch | Holds |
 |---|---|
 | `main` | The latest release, what players have. It moves only when a release is made. |
-| `next` | The next release (the repository's default branch). Every pull request goes here. |
+| `next` | Everything for coming releases (the repository's default branch). **Every pull request goes here.** |
+| `release/<version>` | A feature release being tested, cut from `next` when it freezes (for example `release/0.4.1`). Only fixes for that release go in. |
+| `hotfix/<version>` | An urgent fix to what players have, cut from the latest release's tag (for example `hotfix/0.4.0.2` from `v0.4.0.1`). |
+| `feature/<name>` | A large feature not ready for `next` yet, built up by the maintainers over several pull requests (now `feature/dungeons-in-route`). It goes to `next` as a whole when it's ready. |
 
-Every pull request goes to **`next`**: guide fixes, the addon, the tools,
-the data builds, translations, new guides and route refreshes. Never to
-`main`; the `Base branch` check fails those. `main` moves only when a
-release is made: it is fast-forwarded to `next` and tagged. A patch release
-is just a version bump (`x.y.Z`) from `next`, sooner than a feature release.
+Pull requests go to **`next`**: guide fixes, the addon, the tools, the data
+builds, translations, new guides, new features and route refreshes. Never to
+`main`; the `Base branch` check fails those. `next` keeps taking pull requests
+while a release is tested: the freeze happens on its `release/` branch, not on
+`next`.
+
+The `release/` and `hotfix/` branches are the maintainers'. A fix found while
+a release is tested goes to its `release/` branch, and an urgent fix for
+players goes to a `hotfix/` branch; a maintainer asks you on your pull request
+when that applies. When a release or a hotfix ships, `main` moves to it, it is
+tagged, and the branch is merged back into `next`, so nothing is lost.
 docs/RELEASING.md has the release side.
+
+**Once your pull request is merged, don't push to it again,** not even a
+rebase: GitHub shows it as merged because your exact commits are in the base
+branch. A fix or a follow-up is a new pull request.
 
 ## Using an AI agent
 
@@ -335,6 +359,29 @@ your request matches it; to be sure, name it: "use polestar-triage on #123".
 - Plain messages that describe the change for the players or authors it
   affects (for example "Westfall: turn in at Sentinel Hill before the farms"), not
   how it was made.
+- Commit messages, branch names, pull request titles and descriptions are
+  public for good: a pushed commit stays readable by its SHA even after a
+  force-push. Like every file in the repository (`tests/wording.test.js`),
+  they name no other guide product and never say a route was compared with,
+  follows or matches another guide; a route's reasons are our own (walking,
+  levels, quest data, players' recordings). Drop such a clause rather than
+  swap in another word for it. The words are in `tools/lib/public-text.json`;
+  guides and the fix records' own words (a route fix's `why`, a correction's
+  `note`) are held to the full list, like messages.
+  The *Public text* check reads every pull request's title, description,
+  branch name and commits. To check each message before the commit is made,
+  turn on the repository's hooks once per clone:
+
+  ```sh
+  git config core.hooksPath tools/hooks
+  ```
+
+  `tools/hooks/commit-msg` then refuses a message that breaks the rule and
+  names the line and rule; `tools/hooks/pre-push` checks the branch name and
+  every commit a push would publish that isn't on `origin` yet (commits a
+  rebase or merge brings in from `origin` are public already and aren't
+  checked again). `node tools/public-text.js <file>` checks any text the same
+  way.
 - Behaviour changes come with tests that show the behaviour.
 - Each change brings its changelog entry as a file of its own in
   `changes/` (a fragment), not an edit to CHANGELOG.md: with many pull
@@ -382,6 +429,11 @@ unexplained.
 Then the change is reviewed for correctness (tests, the game's limits,
 Options toggles off by default for anything that spends, equips or acts for
 the player) and merged into its base branch.
+
+**Changes asked in review happen on your pull request,** where you can see
+them: as review comments, or, for small fit-ups (a conflict, a format
+number, a test), as commits a maintainer pushes to your branch. Keep "Allow
+edits by maintainers" ticked. Your commits keep your name either way.
 
 **AI-assisted pull requests:** the model named in the "Model and tool" line
 sets how carefully the work is re-verified. Pull requests from smaller or

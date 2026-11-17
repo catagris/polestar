@@ -133,6 +133,25 @@ fn quest_objectives_normalize_to_text_type_finished_numfulfilled_numrequired() {
 	);
 }
 
+// Camping 101: Alchemy's one objective, "Raise your alchemy skill to 20", came back from Forever's client counted
+// full while unfinished (alchemy 2 of 20): the guide window read "1/1" on a quest still to do (#1952).
+#[test]
+fn issue_1952_an_unfinished_objective_never_reads_full() {
+	let out = run(r#"
+		C_QuestLog.GetQuestObjectives = function(q)
+			return {
+				{ text = "Raise your alchemy skill to 20", type = "object", finished = false, numFulfilled = 2, numRequired = 1 },
+				{ text = "Linen Cloth: 6/6", type = "item", finished = true, numFulfilled = 6, numRequired = 6 },
+			}
+		end
+		local o = C.GetQuestObjectives(97938)
+		emit({ skill = { o[1].numFulfilled, o[1].numRequired, o[1].finished }, cloth = { o[2].numFulfilled, o[2].numRequired } })
+	"#);
+	assert_eq!(out, json!({ "skill": [0, 1, false], "cloth": [6, 6] }));
+}
+
+// Each change the client makes to a quest (its objectives done, a failure, a hand-in or an abandon) comes with
+// QUEST_LOG_UPDATE, as in game; the walk over the log is kept until then.
 #[test]
 fn issue_1327_a_quest_timer_runs_while_a_log_quest_has_time_allowed_and_is_neither_ready_nor_failed() {
 	let out = run(r#"
@@ -144,19 +163,57 @@ fn issue_1327_a_quest_timer_runs_while_a_log_quest_has_time_allowed_and_is_neith
 		C_QuestLog.ReadyForTurnIn = function() return ready end
 		C_QuestLog.IsComplete = function() return ready end
 		C_QuestLog.IsFailed = function() return failed end
+		local function changed() stub.fire("QUEST_LOG_UPDATE") end
 		local r = { running = C.QuestTimerRunning() }
-		ready = true
+		ready = true; changed()
 		r.ready = C.QuestTimerRunning()
-		ready, failed = false, true
+		ready, failed = false, true; changed()
 		r.failed = C.QuestTimerRunning()
-		failed, allowed[29] = false, nil
+		failed, allowed[29] = false, nil; changed()
 		r.untimed = C.QuestTimerRunning()
 		allowed[29] = 1800
-		C_QuestLog.GetTimeAllowed = nil
+		C_QuestLog.GetTimeAllowed = nil; changed()
 		r.noApi = C.QuestTimerRunning()
 		emit(r)
 	"#);
 	assert_eq!(out, json!({ "running": true, "ready": false, "failed": false, "untimed": false, "noApi": false }));
+}
+
+// While-here's poll (every 0.5 s) and the travel planner (every plan) ask whether a quest timer runs: the quest log
+// is walked once per quest-log change, not on every ask, and each answer is the walk's.
+#[test]
+fn the_quest_timer_walks_the_log_once_until_the_quest_log_changes() {
+	let out = run(r#"
+		GetQuestTimers = nil
+		local allowed, walks = { [29] = 1800 }, 0
+		C_QuestLog.GetNumQuestLogEntries = function() walks = walks + 1; return 2, 2 end
+		C_QuestLog.GetInfo = function(i) return ({ { questID = 0, isHeader = true }, { questID = 29 } })[i] end
+		C_QuestLog.GetTimeAllowed = function(q) return allowed[q], 10 end
+		C_QuestLog.IsOnQuest = function() return true end
+		C_QuestLog.ReadyForTurnIn = function() return false end
+		C_QuestLog.IsComplete = function() return false end
+		C_QuestLog.IsFailed = function() return false end
+		stub.fire("QUEST_LOG_UPDATE")
+		local r = { answers = {} }
+		for i = 1, 20 do r.answers[i] = C.QuestTimerRunning() end
+		r.walks = walks
+		allowed[29] = nil; stub.fire("QUEST_LOG_UPDATE")
+		r.after = { C.QuestTimerRunning(), C.QuestTimerRunning() }
+		r.walksAfter = walks
+		for _, e in ipairs({ "QUEST_ACCEPTED", "QUEST_REMOVED", "QUEST_TURNED_IN", "UNIT_QUEST_LOG_CHANGED", "PLAYER_ENTERING_WORLD" }) do
+			allowed[29] = 1800; stub.fire(e, "player")
+			r[e] = C.QuestTimerRunning()
+			allowed[29] = nil; stub.fire("QUEST_LOG_UPDATE")
+		end
+		emit(r)
+	"#);
+	assert_eq!(out["walks"], 1, "twenty asks, one walk: {out}");
+	assert!(out["answers"].as_array().unwrap().iter().all(|a| a == &json!(true)));
+	assert_eq!(out["after"], json!([false, false]));
+	assert_eq!(out["walksAfter"], 2);
+	for e in ["QUEST_ACCEPTED", "QUEST_REMOVED", "QUEST_TURNED_IN", "UNIT_QUEST_LOG_CHANGED", "PLAYER_ENTERING_WORLD"] {
+		assert_eq!(out[e], true, "{e} walks the log again");
+	}
 }
 
 #[test]
@@ -329,6 +386,41 @@ fn secret_unit_values_read_as_unknown_instead_of_throwing() {
 	assert_eq!(out, json!({ "npc": false, "target": 197, "faction": "Neutral", "race": "Human" }));
 }
 
+// #2533: a player's taint log named Polestar for arithmetic on secret values: the travel planner's run speed
+// (GetUnitSpeed) and the map position worked out into percent. Both read as unknown now, never touched.
+#[test]
+fn a_secret_run_speed_or_map_position_reads_as_unknown_and_is_never_worked_on_2533() {
+	let out = run(r#"
+		-- A secret value throws when added to, compared or indexed, as in the client.
+		local function boom() error("secret touched") end
+		local SECRET = setmetatable({}, { __add = boom, __sub = boom, __mul = boom, __div = boom, __eq = boom,
+			__lt = boom, __le = boom, __index = boom, __tostring = function() return "secret" end })
+		function issecretvalue(v) return rawequal(v, SECRET) end
+		local speed, xy, map, vector = 7, nil, 1429, false
+		function GetUnitSpeed(unit) return 0, speed, 7, 4.7 end
+		C_Map.GetBestMapForUnit = function() return map end
+		C_Map.GetPlayerMapPosition = function()
+			if vector then return SECRET end
+			return { x = xy and xy[1] or 0.5, y = xy and xy[2] or 0.25 }
+		end
+		local r = { readable = { C.GetRunSpeed(), { C.GetPlayerMapPosition() }, { C.GetUnitMapPosition("party1") } } }
+		speed = SECRET
+		r.speed = C.GetRunSpeed() or false
+		speed, xy = 7, { SECRET, 0.25 }
+		r.x = C.GetPlayerMapPosition() == nil
+		xy, map = nil, SECRET
+		r.map = C.GetUnitMapPosition("party1") == nil
+		map, vector = 1429, true
+		r.vector = C.GetPlayerMapPosition() == nil
+		emit(r)
+	"#);
+	assert_eq!(out["readable"], json!([7, [1429, 50, 25], [1429, 50, 25]]), "readable values pass through as before");
+	assert_eq!(out["speed"], false, "a secret run speed is unknown");
+	assert_eq!(out["x"], true, "a secret coordinate is no position");
+	assert_eq!(out["map"], true, "a secret map is no position");
+	assert_eq!(out["vector"], true, "a secret position vector is never indexed");
+}
+
 #[test]
 fn c3_nav_qa_the_world_map_opens_through_c_map_openworldmap_when_the_client_has_it_the_global_opener_only_as_a_fallback_never_in_combat() {
 	let out = run(r#"
@@ -379,8 +471,17 @@ fn walk(dir: &Path, root: &Path, bare: &[Regex], comment: &Regex, found: &mut Ve
 
 #[test]
 fn c3_nav_qa_no_addon_code_outside_core_compat_lua_opens_or_moves_the_world_map_itself_openworldmap_toggleworldmap_showuipanel_worldmapframe_worldmapframe_setmapid() {
-	let bare: Vec<Regex> =
-		[r"(^|[^.:\w])OpenWorldMap\b", r"(^|[^.:\w])ToggleWorldMap\s*\(", r"ShowUIPanel\s*\(\s*WorldMapFrame\b", r"WorldMapFrame\s*:\s*SetMapID\s*\("].iter().map(|p| Regex::new(p).unwrap()).collect();
+	let bare: Vec<Regex> = [
+		r"(^|[^.:\w])OpenWorldMap\b",
+		r"(^|[^.:\w])ToggleWorldMap\s*\(",
+		r"ShowUIPanel\s*\(\s*WorldMapFrame\b",
+		r"WorldMapFrame\s*:\s*SetMapID\s*\(",
+		// The quest log is the world map's side panel: its openers open the map too (Compat.OpenQuestLog).
+		r"(^|[^.:\w])(OpenQuestLog|ToggleQuestLog|QuestMapFrame_OpenToQuestDetails)\b",
+	]
+	.iter()
+	.map(|p| Regex::new(p).unwrap())
+	.collect();
 	let comment = Regex::new(r"--.*$").unwrap();
 	let root = addons_dir();
 	let mut found = Vec::new();

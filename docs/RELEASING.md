@@ -56,11 +56,18 @@ the Dungeons journal read the Codex, so data fixes made since reach players
 only once `forge data codex` rebuilds it. Shipping an older Codex on purpose
 is allowed; the warning says what stays behind.
 
-All releases are built from `next`. A patch release (`x.y.Z`) is a smaller,
-sooner release following the same steps with a patch version bump.
-A feature release may go out as release candidates first; see
-[Release candidates](#release-candidates). CONTRIBUTING.md ("Branches") tells
-contributors which branch pull requests go to.
+Branches: every pull request goes to `next`. A feature release is cut from
+`next` as `release/<version>` when it freezes; the data build, the bake, the
+gates, release candidates and the maintainer's in-game test happen there, and
+only fixes for that release go in, while `next` keeps taking pull requests. A
+patch release (`x.y.Z` or a fourth number for an urgent hotfix) is cut as
+`hotfix/<version>` from the latest release's tag, with only its fixes. Either
+one ships the same way: `main` is fast-forwarded to it and tagged, then it is
+merged back into `next` and the branch deleted. Below, "the release branch"
+is that `release/` or `hotfix/` branch. A feature release may go out as
+release candidates first; see [Release candidates](#release-candidates).
+CONTRIBUTING.md ("Branches") tells contributors which branch pull requests go
+to.
 
 ## After merging contributor PRs
 
@@ -153,11 +160,13 @@ this list):
 These are the steps of a feature release. Replace `0.2.0` with the new
 version throughout.
 
-1. Start from a clean, up-to-date `next` with the game client installed
-   (the data build reads its tables and installed addons). Work and pull
-   requests for the coming release collect on `next` (the default branch,
-   pushed as it goes); `main` holds the latest release and moves only in
-   step 7. Releases come in batches, when the maintainer decides.
+1. Cut the release branch and work from a clean checkout of it, with the game
+   client installed (the data build reads its tables and installed addons):
+   `git switch -c release/0.2.0 origin/next` (a patch:
+   `git switch -c hotfix/0.2.1 v0.2.0`), then push it. Pull requests keep
+   collecting on `next` (the default branch); `main` holds the latest release
+   and moves only in step 7. Releases come in batches, when the maintainer
+   decides.
 
 2. Set the version and rebuild the data, the data addons and the guides:
 
@@ -167,16 +176,29 @@ version throughout.
    forge data questdb
    forge data itemdb && forge data gear
    forge data sources --only builders && forge data codex   # release-safe inputs only
-   forge release credits                     # Guiding Stars: data/credits.json + merged or folded PRs + issues (needs gh)
+   forge release credits                     # Guiding Stars: data/credits.json + merged or folded PRs + issues (needs gh) + translators; --release-ref <branch> when HEAD isn't the release
    forge guide lint
    forge guide compile
+   forge guide lint experimental && forge guide compile experimental   # Polestar Experimental (alpha guides)
    ```
+
+   `experimental/` holds Polestar Experimental: guides for Forever's new
+   zones in testing, a pack of Polestar's own that ships in the zip as
+   `Polestar_Experimental`, loaded on demand and off until a player chooses
+   one of its guides at a route choice or switches it on under Options >
+   Community guides (PACK_FORMAT.md, "Polestar's own extra packs"). `forge
+   release version` sets its `pack.json` with `guides/pack.json`, and `forge
+   release pack` builds it again and stops on an error in it. `forge guide
+   compile` reads it too: Polestar_Guides carries the index of the
+   experimental guides our route choices offer, so compile both after an
+   edit to either.
 
    `Polestar_QuestDB` is not in the repository (it is ignored, like the
    Codex): build it with `forge data questdb` on every release machine
    before `forge release pack`, or the zip goes out without it. The language
    folders (`Polestar_<locale>`: guide texts and names) are committed; rebuild
-   their names with `forge data names` when the data changed.
+   their names with `forge data names` when the data changed, and their
+   subzone names with `forge data subzones` when the walking maps did.
 
    Compile after `forge release version`, never before: `forge release
    version` writes the TOCs, but the guide pack's version in
@@ -188,9 +210,24 @@ version throughout.
    `Polestar_Guides*` TOC equal the release version (a test build carries
    its `x.y.z-rcN` the same way).
 
+   After the last change to a leveling guide, regenerate
+   `addon/Polestar/Core/LegacySteps.lua` with every release players may
+   update from as an `--old` (each `vX.Y.Z` tag's `guides`, the last release
+   included): `git archive <tag> guides | tar -x -C <dir>/<tag>`, then
+   `node tools/legacy-steps.js --old <dir>/v0.3.4/guides ... --old
+   <dir>/<last release>/guides`, and commit it. The mapping above reads a
+   save's changed steps from it: a step it does not list keeps no check-off,
+   skip or saved view, and nothing in its stretch passes behind the player;
+   its `ns.LegacyMovedIn` (the quests each guide now offers that a release
+   offered in another guide) keeps old-route progress from placing a player.
+   0.3.7.2 changed 23 guide files without a new one, and 0.4.0's had no
+   0.3.7.x in it (#2350).
+
    Don't regenerate `addon/Polestar/Nav/TravelData.lua` (`forge data
-   travel`) on a release build unless its output keeps every portal of the
-   committed file: check `git diff` before committing.
+   travel`) on a release build unless its output keeps every portal and
+   every flight point of the committed file (the Forever ones need the
+   Forever build's TaxiNodes and TaxiPath in `data/sources`: `forge data
+   sources --only builders`): check `git diff` before committing.
 
    Pass `--questie` explicitly on a release build. Without it the build
    picks the first QuestieDB it finds among the installed clients, so a
@@ -201,6 +238,16 @@ version throughout.
    `Polestar_Codex/Meta.lua`, unless the release moves to a newer one on
    purpose; the data build's statistics check stops a build whose QuestieDB
    changed underneath it.
+
+   A newer QuestieDB can narrow quests' races: its generated Forever quest
+   base takes a web-database scrape's race lists, which can leave out races
+   that take the quest in game (1.0.14 narrowed 75 quests; corrections set
+   them back). Before a release moves to one, build it once into a copy of
+   `data/forever` (`--out <copy>`), lint every guide on that build, and read
+   the statistics report's `quests.races.*` lines. Build into a copy, never
+   an empty folder: the knowledge base adds the Forever world database's
+   class trainers to the `trainers.json` it finds in the output folder, and
+   the statistics check compiles the guides with the files already there.
 
    `forge i18n guides sync` and `forge guide compile` read the client's
    AreaTable from `data/sources/wago/<build>/AreaTable.csv`, found beside
@@ -214,8 +261,26 @@ version throughout.
    packing, compare each `addon/Polestar_<locale>/Texts.lua`'s entry count
    with the last release's: a large drop means translations went missing.
 
+   Run `credits` on the commit the release ships, before it reaches
+   `next`: contributors' pull requests batched into the release's
+   integration branch (merged at their exact head commits) are still open
+   on GitHub until that push, and count only because their head is on the
+   release ref. The ref is the checkout's `HEAD`; from another checkout name
+   it with `--release-ref` (e.g. `--release-ref origin/dev-040`). Drafts
+   count the same way, only when their head is on the ref. A pull request
+   whose author pushed again after the batch doesn't count (and GitHub won't
+   mark it merged) until the batch merges its new head. Issues that such an
+   open pull request closes count for their reporters as fixed. Check the
+   printed line: "N by merged pull requests alone" against the total shows
+   how many contributors the batches add.
+
    Before `credits`, add new Ko-fi supporters to `data/credits.json`
-   (names only, highest total first; amounts are never stored). The bug
+   (names only, highest total first; amounts are never stored), and anyone
+   whose idea shipped though someone else built it to its `ideas`
+   (`{ "name": "<login>", "ref": <pull request or issue> }`; the changelog's
+   "idea by" and "idea first proposed by" credits are the list to check). The
+   translators come from the locales' `translators` (rust/crates/forge-guide/
+   src/locales.rs and tools/lib/i18n/locales.js). The bug
    reporters column counts a reporter's useful reports from the issues: the
    Discord name the bot filed it under ("**Reported by <name> on
    [Discord](...)**"), else the GitHub login that opened it. A report counts
@@ -237,12 +302,49 @@ version throughout.
    node --test "tests/**/*.test.js"
    ```
 
+   Then the reported-problems gate: every player-reported problem that was
+   fixed stays fixed. It runs the tests `tests/reported-gate.json` names for
+   each confirmed report, the whole of `tests/guides-reported.test.js`, the
+   judge's player-report seeds on the shipped guides and the danger gate
+   (`tools/danger-gate.js`) on the candidate's calibrated level model, and
+   names the reports whose tests fail:
+
+   ```sh
+   npm run test:reported -- --levels <Alliance.json>,<Horde.json>
+   ```
+
+   A fix for a report adds the report to `tests/reported-gate.json` with the
+   test that pins it (`tests/reported-gate.test.js` checks every test named
+   there exists).
+
+   Then the levels guard: every leveling guide's `levels` header says the
+   levels the route brings a player there (per faction where a guide is
+   shared). `data/route-levels.json` holds each guide's arrival and exit
+   from the level model; refresh it from the same model runs the danger
+   gate read, then run its test:
+
+   ```sh
+   node tools/route-levels.js --levels <Alliance.json>,<Horde.json>
+   node --test tests/route-levels.test.js
+   ```
+
+   The refresh prints every guide whose arrival or exit moved by half a
+   level or more. A header passes when its first level is the arrival
+   floored or rounded and its last the exit floored or rounded (57.7 reads
+   57 or 58). A failing guide gets its header fixed by hand (in the guide
+   and its `forge/seed/` copy, with its pitch if the pitch quotes the range,
+   `guides/GENERATED.json` and `forge/seed/SEED.json` rehashed, `forge guide
+   check-generated` clean), or, when the header is right for players on
+   other evidence, a `keep` row with the reason. On a release candidate fix
+   only the guides the test names; never rewrite every header at once.
+   Commit the refreshed snapshot with the release.
+
 4. Pack and check the archives:
 
    ```sh
-   rm -rf dist && forge release pack     # stops naming any guide whose legs are stale; add --bake --grid <canon grid> --leffe <Leffe's maps> to bake them
+   rm -rf dist && forge release pack     # stops naming any leveling guide whose legs are stale or missing; add --bake --grid <canon grid> --leffe <Leffe's maps> to bake them
    (cd dist && sha256sum -c SHA256SUMS)
-   unzip -l dist/Polestar-0.2.0.zip      # Polestar_Codex/ with its LICENSE-DATA.txt, and Polestar_Nav/ with its LICENSE and CREDITS.md, are listed
+   unzip -l dist/Polestar-0.2.0.zip      # Polestar_Codex/ with its LICENSE-DATA.txt, Polestar_Nav/ with its LICENSE and CREDITS.md, and Polestar_Experimental/ are listed
    forge nav check                       # Polestar_Nav's walking maps match its PACK.json
    ```
 
@@ -294,20 +396,23 @@ version throughout.
 7. Assemble the changelog from the fragments in `changes/` (CONTRIBUTING.md,
    "Commits and pull requests"), then commit it with the version bump and
    the regenerated files that are tracked (`git status` lists them;
-   `Polestar_QuestDB` and the other local packs are ignored) on `next`,
-   bring `main` up to it, tag and push both. The maintainer's pushes pass
-   the branch rules (see [Branch rules](#branch-rules)):
+   `Polestar_QuestDB` and the other local packs are ignored) on the release
+   branch, bring `main` up to it, tag, push, then merge it back into `next`.
+   The maintainer's pushes pass the branch rules (see
+   [Branch rules](#branch-rules)):
 
    ```sh
    forge changelog build 0.2.0     # writes "## 0.2.0 (<today>)", deletes the fragments
-   git add CHANGELOG.md changes package.json guides/pack.json addon/Polestar addon/Polestar_Guides addon/Polestar_ItemDB addon/Polestar_Nav addon/Polestar_Recorder
+   git add CHANGELOG.md changes package.json guides/pack.json experimental/pack.json addon/Polestar addon/Polestar_Guides addon/Polestar_Experimental addon/Polestar_ItemDB addon/Polestar_Nav addon/Polestar_Recorder
    git commit -m "Release: 0.2.0"
-   git switch main && git merge --ff-only next && git switch next
+   git switch main && git merge --ff-only release/0.2.0
    git tag -a v0.2.0 -m "Polestar 0.2.0" main
-   git push origin main next v0.2.0
+   git push origin main v0.2.0
+   git switch next && git merge --no-ff release/0.2.0 -m "Merge release 0.2.0 back into next"
+   git push origin next && git push origin --delete release/0.2.0
    ```
 
-   These pushes of `next`, `main` and the tag go past the branch rules on
+   These pushes of `main`, `next` and the tag go past the branch rules on
    the maintainer's admin bypass, and only with the maintainer's go for that
    release; git prints "Bypassed rule violations" for them. Any other push
    that prints it (a branch, a tag deletion) is a mistake: stop and ask
@@ -412,10 +517,12 @@ GitHub's rulesets for the repository, under Settings, Rules:
 | Branch | Rules |
 |---|---|
 | `next` | changes by pull request only, with `Tests` and `Base branch` passing; no force push, no deletion |
+| `release/**`, `hotfix/**`, `feature/**` | changes by pull request only, with green CI; only admins create them |
 | `main` | only maintainers update it; no force push, no deletion |
 
-Repository admins bypass both, which the release steps rely on (the
-pushes of step 7). Branches are deleted when their pull request merges.
+Repository admins bypass them, which the release steps rely on (cutting the
+release branch and the pushes of step 7). Branches are deleted when their
+pull request merges.
 
 ## Release candidates
 
@@ -426,7 +533,7 @@ go to testers first. Build it as in [Steps](#steps) with the version
 - leave the fragments in `changes/`: only the final release runs
   `forge changelog build`. `forge changelog show` prints what the
   candidate carries, for its notes;
-- tag `v0.3.0-rc.1` on `next`; `main` does not move for a candidate;
+- tag `v0.3.0-rc.1` on the release branch; `main` does not move for a candidate;
 - publish with `gh release create v0.3.0-rc.1 --verify-tag --prerelease`
   (never `--latest`), so `releases/latest` stays on the last release. The
   Discord workflow then pings the tester role in the testers channel instead
@@ -434,5 +541,6 @@ go to testers first. Build it as in [Steps](#steps) with the version
 - upload to CurseForge as release type Beta, which only players who opt in
   get.
 
-Fixes go to `next` and out as `-rc.2`. When a candidate brings no new bugs,
+Fixes for the candidate go to its release branch (and on into `next` when it
+is merged back) and out as `-rc.2`. When a candidate brings no new bugs,
 set the version to `0.3.0` and release it with the full steps.
