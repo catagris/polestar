@@ -20,7 +20,7 @@ ns.UI.GuideFrame.Part(function(GF)
 			{ separator = true },
 		}
 		for _, it in ipairs(GF.TabListItems()) do items[#items + 1] = it end
-		W.ShowMenu(button, items)
+		W.ShowMenu(button, items, { current = true })
 	end
 
 	function openMenu(button)
@@ -73,9 +73,14 @@ ns.UI.GuideFrame.Part(function(GF)
 				ns.Print(L["Guide window hidden. Type /polestar to bring it back."])
 			end },
 		}) do items[#items + 1] = it end
-		-- The Stats section of the hub (Stats/View.lua), under the Recorder's entry.
+		-- The Stats section of the hub (Stats/View.lua), under the Recorder's and the Arcade's entries.
 		if ns.Stats then
 			table.insert(items, 5, { text = L["Stats"], icon = "layers", onClick = function() ns.Fire("SHOW_STATS") end })
+		end
+		-- Freedoom Arcade (Maps/Arcade.lua), while a copy of it is there.
+		local arcade = ns.Arcade
+		if arcade and arcade.Available() then
+			table.insert(items, 5, { text = L["Play Freedoom Arcade"], icon = "gamepad", onClick = function() arcade.Open() end })
 		end
 		-- The Recorder's window, while the Recorder addon is loaded.
 		if type(PolestarRecorder_Command) == "function" then
