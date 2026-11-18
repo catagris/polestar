@@ -6,18 +6,13 @@
 --
 --   the world's art       always
 --   the continents' art   over it, as the view closes in (CONT_FADE)
---   the zones' base art   each zone's own map (its parchment), faded out at
---                         its frame through a mask (Media/Map/feather), so
---                         neighbours run into each other with no straight
---                         edge (DETAIL_FADE); it covers the continents' art,
---                         which is coarse this close
---   the zones' overlays   the explored-area paintings, over every zone's
---                         base: a zone's land is never under its neighbour's
---                         parchment
---   a map with no overlays (a city): its base art through a rounded mask
---                         (feather-round: its paper border and corners drop
---                         away), once it fills a good part of the view
---                         (CITY_FADE)
+--   the zones' base art   faded out at each zone's frame through a mask
+--                         (Media/Map/feather), so neighbours meet with no
+--                         straight edge (DETAIL_FADE)
+--   the zones' overlays   the explored-area paintings, over every base
+--   a city (no overlays)  its base art through a rounded mask
+--                         (feather-round), once it fills a good part of the
+--                         view (CITY_FADE)
 --
 -- Only what meets the frame gets a texture, from a pool that grows to the
 -- busiest view.

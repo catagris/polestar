@@ -1,19 +1,11 @@
 -- The Stats section of the hub: what this character has done, from the
 -- totals Collect.lua keeps. The sidebar lists the pages (Activity,
--- Character, Time, Gold, Professions) and, under a rule, the world map (and
--- any zone played in that is not on it, the longest stayed in first). The world map is one
--- canvas of every zone (Stats/WorldArt.lua: the world's art, the continents'
--- and then the zones' as the view closes in; the client's textures, none
--- shipped) with a tab per layer: the walked path as thin lines, then heat
--- cells for time spent, kills, XP from kills, XP from quests and deaths,
--- and the journeys across it: the flight paths flown, then the boats and
--- zeppelins ridden with the jumps (a portal, a hearthstone, the tram).
--- A zone the client cannot place on the world (or every zone, on a client
--- that places none) keeps a page of its own on the zone's map art
--- (UI/ZoneArt.lua); SV.OnNav("map:<id>") of a zone that is on the world
--- opens the world map framed on it. The mouse wheel over the
--- map zooms in on the cursor, dragging moves it, a right-click goes back to
--- where it opened: the zones played in, or the whole zone.
+-- Character, Time, Gold, Professions), then the world map: every zone on
+-- one canvas (Stats/WorldArt.lua) with a tab per layer: the walked path,
+-- heat for time, kills, XP and deaths, and the journeys (flights, rides and
+-- jumps). A zone the client cannot place on the world keeps a page of its
+-- own on its map art (UI/ZoneArt.lua). The wheel zooms in on the cursor,
+-- dragging moves the map, a right-click goes back to where it opened.
 --
 --   SV.Zoom(steps[, px, py]), SV.Pan(dx, dy), SV.ResetView(): the same, in
 --   frame pixels (the scripts on the map call them; tests too).
@@ -69,8 +61,7 @@ local PAGES = {
 }
 
 -- The marks' colours are their own, not the theme's: they have to stand out
--- on the map art, which is brown and green whatever the look. The art is
--- drawn with some of its colour out (MAP_DESAT).
+-- on the map art, which is drawn with some of its colour out (MAP_DESAT).
 local MAP_DESAT = 0.6
 local PATH_COLOR = { 0.25, 0.95, 1.00 } -- the walked path: bright cyan
 local JUMP_COLOR = { 1, 1, 1 }
@@ -387,8 +378,7 @@ local focusOn -- a zone to frame on the world's next draw (picked in the sidebar
 local function maxZoom() return drawn and drawn.maxZoom or MAX_ZOOM end
 
 -- How much of the canvas the frame shows each way at zoom 1 (0..1): all of
--- it across; less down when the frame is flatter than the map, which then
--- fills its width (the art covers the frame).
+-- it across, less down when the frame is flatter than the map.
 local function reach()
 	if not mapArt then return 1, 1 end
 	local mw, mh = mapArt.psW, mapArt.psH
@@ -424,8 +414,7 @@ end
 
 -- A zone's heat with each cell's value spread over the cell and the eight
 -- around it (SPLAT), so the grid reads as heat and not as specks in rows:
--- { [row * GRID + column, from 0] = value }. What would fall off the zone's
--- map is left out. Made once a zone.
+-- { [row * GRID + column, from 0] = value }. Made once a zone.
 local function spread(z)
 	local out = z.spread
 	if out then return out end
@@ -883,9 +872,8 @@ function SV.Build(parent, shell)
 	return root
 end
 
--- The page in view: a page key, "world" (the one map of every zone that
--- lies on the world map), or "map:<uiMapID>" with the map (a zone that does
--- not: its own map).
+-- The page in view: a page key, "world", or "map:<uiMapID>" with the map (a
+-- zone that is not on the world map).
 local function current()
 	local key = ns.Get("stats.page")
 	local map = type(key) == "string" and tonumber(key:match("^map:(%d+)$"))
@@ -933,9 +921,8 @@ function SV.Render()
 	shown.fonts, shown.rects, shown.lines = C.Counts(pool)
 end
 
--- The sidebar: the pages, then the world map, and the zones played in that
--- are not on it (each has a page of its own; on a client that places no zone
--- on the world, that is every zone).
+-- The sidebar: the pages, then the world map and the zones played in that
+-- are not on it.
 function SV.Nav()
 	local out = {}
 	for i, pg in ipairs(PAGES) do out[i] = { key = pg.key, label = pg.label } end
