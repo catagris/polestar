@@ -85,11 +85,14 @@ w.setXP(1500)
 local a = S()
 local h = Stats.Heat(1439)
 local cell = Stats.Cell(40, 50)
+local _, killXP = Stats.Heat(1439, "x")
+local _, questXP = Stats.Heat(1439, "q")
 emit({ xp = { a.xp.total, a.xp.quests, a.xp.explore, a.xp.kills }, kills = a.kills,
-	heat = { h.k[cell], h.x[cell], h.q[cell] } })"#);
+	heat = { h.k[cell], killXP, questXP }, levels = { h.x[cell] >= 113 and h.x[cell] <= 217, h.q[cell] >= 217 and h.q[cell] <= 417 } })"#);
 	assert_eq!(out["xp"], json!([500, 300, 40, 160]), "total, quests, exploring (its line counted once), kills the rest");
 	assert_eq!(out["kills"], 2);
-	assert_eq!(out["heat"], json!([2, 160, 300]), "kills, kill XP and quest XP in the cell the player stands in");
+	assert_eq!(out["heat"], json!([2, 160, 300]), "kills in the cell the player stands in, and the zone's kill XP and quest XP to the point");
+	assert_eq!(out["levels"], json!([true, true]), "the cell holds each as a level: the one under or over the value");
 }
 
 #[test]
@@ -252,7 +255,11 @@ emit({ pages = pages, keys = keys, active = active, name = name, path = path, ti
 	assert_eq!(out["pages"], json!([["activity", "Activity", true], ["character", "Character", true], ["time", "Time", true], ["gold", "Gold", true], ["professions", "Professions", true]]));
 	assert_eq!(out["keys"], json!(["activity", "character", "time", "gold", "professions", "-", "map:1439"]));
 	assert_eq!(out["active"], "professions");
-	assert_eq!(out["time"], json!(["map:1439", 1439, 4, 2]), "the sample that arrived (the minute standing there is not time on the move): one cell, spread over its neighbours, in blocks of two cells a side");
+	assert_eq!(
+		out["time"],
+		json!(["map:1439", 1439, 4, 2]),
+		"the sample that arrived (the minute standing there is not time on the move): one cell, spread over its neighbours, in blocks of two cells a side"
+	);
 	assert_eq!(out["deaths"], json!([4, 1]));
 	assert_eq!(out["path"], json!(["map:1439", 0, 1]), "the path layer comes first: one point where the player stood, no line yet");
 	assert_eq!(out["title"], "Darkshore");
@@ -262,10 +269,11 @@ emit({ pages = pages, keys = keys, active = active, name = name, path = path, ti
 }
 
 #[test]
-fn the_walked_path_is_kept_as_points_broken_at_a_jump_and_capped_a_zone() {
+fn the_walked_path_is_one_list_for_the_character_broken_at_a_jump_and_capped_the_oldest_going_first() {
 	let out = run(r#"
 local w = stub.world
-local function at(x, y) w.moveTo(1439, x, y) Stats.Tick(2) end
+w.addMap(1438, { name = "Teldrassil", c = 1, left = 3000, right = 1000, top = 1000, bottom = -1000 })
+local function at(x, y, map) w.moveTo(map or 1439, x, y) Stats.Tick(2) end
 at(40, 50) at(40.05, 50) at(41, 50) at(42, 51)
 at(80, 20) at(81, 20)
 local t = Stats.Trail(1439)
@@ -274,42 +282,98 @@ for i, p in ipairs(t) do
 	local x, y = Stats.TrailXY(p)
 	pts[i] = x and { x, y } or "break"
 end
-for i = 1, 7000 do at(10 + (i % 800) / 10, 10 + i / 100) end
-emit({ pts = pts, kept = #Stats.Trail(1439) <= 6200, newest = { Stats.TrailXY(Stats.Trail(1439)[#Stats.Trail(1439)]) } })"#);
+local stored = { unpack(Stats.Store().path) }
+for i = 1, 22000 do at(10 + (i % 400) / 5, 10 + (i % 8000) / 100, 1438) end
+local path = Stats.Store().path
+local last = Stats.Trail(1438)
+emit({ pts = pts, stored = stored, kept = { #path >= Stats.MAX_PATH, #path <= Stats.MAX_PATH + 500 }, first = path[1], gone = Stats.Trail(1439) == nil,
+	newest = { Stats.TrailXY(last[#last]) } })"#);
 	assert_eq!(out["pts"], json!([[40, 50], [41, 50], [42, 51], "break", [80, 20], [81, 20]]), "standing still adds nothing, a jump across the map breaks the line");
-	assert_eq!(out["kept"], true);
-	assert_eq!(out["newest"], json!([70, 80]));
+	assert_eq!(out["stored"], json!([-1439, 40005001, 41005001, 42005101, -1439, 80002001, 81002001]), "one list: a run starts with its map");
+	assert_eq!(out["kept"], json!([true, true]), "no more than the cap, whatever the zones");
+	assert_eq!(out["first"], -1438, "what is left starts with its map");
+	assert_eq!(out["gone"], true, "the oldest walks went first: Darkshore's");
+	assert_eq!(out["newest"], json!([10, 70]));
 }
 
 #[test]
-fn a_v1_store_moves_its_heat_onto_the_finer_grid() {
+fn a_heat_cell_is_a_level_in_its_tiles_string_exact_while_small_and_right_on_average_beyond() {
 	let out = run(r#"
-PolestarCharDB.stats = { v = 1, heat = { [1439] = { t = { [50 * 80 + 40 + 1] = 30 }, k = { [1] = 2 } } } }
-local s = Stats.Store()
-local h = Stats.Heat(1439)
-emit({ v = s.v, grid = Stats.GRID, t = h.t[Stats.Cell(50.7, 63.2)], k = h.k[Stats.Cell(0.7, 0.7)], again = Stats.Store().heat[1439].t[Stats.Cell(50.7, 63.2)] })"#);
-	assert_eq!(out["v"], 3);
-	assert_eq!(out["grid"], 480);
-	assert_eq!(out["t"], 30);
-	assert_eq!(out["k"], 2);
-	assert_eq!(out["again"], 30, "migrated once");
+local w = stub.world
+local seed = 1
+Stats.Roll = function() seed = (seed * 16807) % 2147483647 return seed / 2147483647 end
+local function kills(x, y, n) w.moveTo(1439, x, y) for _ = 1, n do stub.fire("CHAT_MSG_COMBAT_XP_GAIN", "x") end end
+local G = Stats.GRID
+local function centre(cx, cy) return (cx + 0.5) / G * 100, (cy + 0.5) / G * 100 end
+-- One tile (cells 32..47 each way): its first cell, one past a long gap, its last; and a cell in another tile.
+local x, y = centre(32, 32) kills(x, y, 10)
+x, y = centre(40, 37) kills(x, y, 3)
+x, y = centre(47, 47) kills(x, y, 1)
+x, y = centre(100, 200) kills(x, y, 1000)
+local layer = Stats.Store().heat[1439].k
+local tiles, kinds = 0, {}
+for k, v in pairs(layer) do if type(k) == "number" then tiles = tiles + 1 kinds[type(v)] = true end end
+local cells, total = Stats.Heat(1439, "k")
+local n = 0
+for _ in pairs(cells) do n = n + 1 end
+local big = cells[200 * G + 100 + 1]
+emit({ tiles = tiles, strings = kinds.string == true and next(kinds, "string") == nil, total = total, n = n,
+	small = { cells[32 * G + 32 + 1], cells[37 * G + 40 + 1], cells[47 * G + 47 + 1] }, big = big, near = big > 500 and big < 2000,
+	levels = { Stats.LEVEL_VALUE[16], Stats.LEVEL_VALUE[17], Stats.LEVEL_VALUE[64] } })"#);
+	assert_eq!(out["tiles"], 2, "a tile for each 16 x 16 cells with anything in them");
+	assert_eq!(out["strings"], true, "each a string, not a table of cells");
+	assert_eq!(out["total"], 1014, "the layer's total is kept to the point");
+	assert_eq!(out["n"], 4);
+	assert_eq!(out["small"], json!([10, 3, 1]), "up to 16 a cell holds the number itself, wherever it lies in the tile");
+	assert_eq!(out["near"], true, "beyond, a level: a thousand kills one at a time land near a thousand ({})", out["big"]);
+	assert_eq!(out["levels"], json!([16, 22, 100000000]));
 }
 
 #[test]
-fn a_v2_store_shares_each_heat_cell_out_over_the_four_it_covers() {
+fn a_tile_walked_all_over_is_no_longer_than_its_cells_and_a_few_digits() {
 	let out = run(r#"
-PolestarCharDB.stats = { v = 2, heat = { [1439] = { t = { [50 * 240 + 40 + 1] = 30 }, d = { [1] = 1 } } }, trail = { [1439] = { 40005001 } } }
+local w = stub.world
+local G = Stats.GRID
+for cy = 16, 31 do
+	for cx = 16, 31 do
+		w.moveTo(1439, (cx + 0.5) / G * 100, (cy + 0.5) / G * 100)
+		stub.fire("CHAT_MSG_COMBAT_XP_GAIN", "x")
+	end
+end
+local layer = Stats.Store().heat[1439].k
+local tiles, longest = 0, 0
+for k, v in pairs(layer) do if type(k) == "number" then tiles, longest = tiles + 1, math.max(longest, #v) end end
+local cells = Stats.Heat(1439, "k")
+local n, ones = 0, true
+for _, v in pairs(cells) do n = n + 1 if v ~= 1 then ones = false end end
+emit({ tiles = tiles, longest = longest, n = n, ones = ones, corners = { cells[16 * G + 16 + 1], cells[31 * G + 31 + 1] } })"#);
+	assert_eq!(out["tiles"], 1);
+	assert_eq!(out["longest"], 264, "256 cells in four runs of 64: a zone walked all over is 900 such tiles, some 290 KiB a layer, and no more");
+	assert_eq!(out["n"], 256);
+	assert_eq!(out["ones"], true);
+	assert_eq!(out["corners"], json!([1, 1]));
+}
+
+#[test]
+fn an_older_store_turns_its_cells_into_tiles_and_its_zone_paths_into_the_one_path() {
+	let out = run(r#"
+local a, b = Stats.Cell(40, 50), Stats.Cell(40.3, 50)
+PolestarCharDB.stats = { v = 3, heat = { [1439] = { t = { [a] = 30, [b] = 5 }, d = { [1] = 1 } } },
+	trail = { [1439] = { 40005001, 41005001, 0, 80002001 }, [1440] = { 10001001 } } }
 local s = Stats.Store()
-local h = Stats.Heat(1439)
-local sum, n = 0, 0
-for _, v in pairs(h.t) do sum, n = sum + v, n + 1 end
-emit({ v = s.v, cells = n, sum = sum, corners = { h.t[100 * 480 + 80 + 1], h.t[101 * 480 + 81 + 1] }, deaths = h.d[1], trail = #Stats.Trail(1439) })"#);
-	assert_eq!(out["v"], 3);
-	assert_eq!(out["cells"], 4);
-	assert_eq!(out["sum"], 30, "the total is kept");
-	assert_eq!(out["corners"], json!([7.5, 7.5]));
-	assert_eq!(out["deaths"], 0.25);
-	assert_eq!(out["trail"], 1, "the walked path is untouched");
+local t, total = Stats.Heat(1439, "t")
+local again = Stats.Store()
+emit({ v = s.v, cells = { t[a], t[b] }, total = total, deaths = Stats.Heat(1439).d[1], path = s.path, old = s.trail == nil,
+	trail = Stats.Trail(1439), zone = Stats.HeatMaps()[1].seconds, once = again.heat[1439].t.n })"#);
+	assert_eq!(out["v"], 4);
+	assert_eq!(out["cells"], json!([31, 5]), "a cell takes the level nearest its value");
+	assert_eq!(out["total"], 35, "the total is kept to the point");
+	assert_eq!(out["deaths"], 1);
+	assert_eq!(out["path"], json!([-1439, 40005001, 41005001, -1439, 80002001, -1440, 10001001]));
+	assert_eq!(out["old"], true);
+	assert_eq!(out["trail"], json!([40005001, 41005001, 0, 80002001]), "a zone's path reads as before: 0 between its runs");
+	assert_eq!(out["zone"], 35);
+	assert_eq!(out["once"], 35, "converted once");
 }
 
 #[test]
@@ -481,7 +545,11 @@ emit({ far = far, farFiles = farFiles, near = near, explored = explored, deepest
 	);
 	assert_eq!(out["far"], json!([1, 12, 0, 0, 0, true]), "the whole world: its twelve tiles and nothing over them");
 	assert_eq!(out["farFiles"], json!([true, false, false]));
-	assert_eq!(out["near"], json!([1, 1, 1, true, true, true, false, "feather", "feather", false, true]), "a zone in close: its base and overlays, faded out at its frame, over the continent's art as it is");
+	assert_eq!(
+		out["near"],
+		json!([1, 1, 1, true, true, true, false, "feather", "feather", false, true]),
+		"a zone in close: its base and overlays, faded out at its frame, over the continent's art as it is"
+	);
 	assert_eq!(out["explored"], json!([1, true, false, true]), "a zone the table has no art for: the overlays the character has explored");
 	assert_eq!(out["deepest"], 240, "as far into the narrowest zone played in as a zone's own map goes");
 }
@@ -543,7 +611,10 @@ end
 
 #[test]
 fn a_flight_paths_route_is_kept_on_the_continents_map_and_drawn_on_the_flights_layer() {
-	let out = run_atlas(&[TRAVEL, r#"
+	let out = run_atlas(
+		&[
+			TRAVEL,
+			r#"
 step(1439, 40, 50)
 w.onTaxi = true
 step(1439, 50, 50) step(1439, 60, 50) step(1439, 60, 50) step(1439, 70, 50)
@@ -559,7 +630,10 @@ local s = V.Shown()
 local world = { s.page, s.cells, s.zones, s.total }
 V.OnNav("map:2000")
 emit({ route = points(Stats.Routes("f")[1414]), counted = { a.flights, a.flightSeconds }, walked = walked, world = world,
-	rides = next(Stats.Routes("r")) == nil, jumps = #Stats.Jumps() })"#].concat());
+	rides = next(Stats.Routes("r")) == nil, jumps = #Stats.Jumps() })"#,
+		]
+		.concat(),
+	);
 	// Darkshore is a tenth of Kalimdor across, around its middle: 10% of the zone is 1% of the continent.
 	assert_eq!(out["route"], json!([[50, 50], [51, 50], [52, 50]]), "a point where the flight moved, on the continent's map");
 	assert_eq!(out["counted"], json!([1, 8]));
@@ -571,7 +645,10 @@ emit({ route = points(Stats.Routes("f")[1414]), counted = { a.flights, a.flightS
 
 #[test]
 fn being_carried_faster_than_the_character_moves_is_a_ride_and_a_short_one_is_dropped() {
-	let out = run_atlas(&[TRAVEL, r#"
+	let out = run_atlas(
+		&[
+			TRAVEL,
+			r#"
 step(1439, 40, 50)
 -- Running at 7 yards a second: 14 yards (0.7% of the zone) a sample is the character's own doing.
 speed = 7
@@ -591,7 +668,10 @@ V.OnNav("world")
 V.SetLayer("r")
 V.Zoom(-40)
 emit({ running = running, boat = boat, first = ends[1], last = ends[#ends], after = { S().rides, #Stats.Routes("r")[1414] },
-	drawn = V.Shown().cells > 0, jumps = #Stats.Jumps() })"#].concat());
+	drawn = V.Shown().cells > 0, jumps = #Stats.Jumps() })"#,
+		]
+		.concat(),
+	);
 	assert_eq!(out["running"], json!([0, true]));
 	assert_eq!(out["boat"], json!([1, true, 9]), "the ride begins on its second carried sample");
 	assert_eq!(out["first"], json!([49.6, 50]));
@@ -603,7 +683,10 @@ emit({ running = running, boat = boat, first = ends[1], last = ends[#ends], afte
 
 #[test]
 fn arriving_far_from_where_the_character_was_is_a_jump_drawn_as_a_straight_line() {
-	let out = run_atlas(&[TRAVEL, r#"
+	let out = run_atlas(
+		&[
+			TRAVEL,
+			r#"
 step(1439, 50, 50)
 step(1439, 50.5, 50)
 step(1438, 50, 50)                      -- a portal: 3,500 yards in one sample
@@ -623,7 +706,10 @@ V.OnNav("world")
 V.SetLayer("r")
 V.Zoom(-40)
 emit({ portal = portal, tram = tram, dungeon = #Stats.Jumps(), first = { j[1], { Stats.TrailXY(j[2]) }, j[3], { Stats.TrailXY(j[4]) } },
-	drawn = V.Shown().jumps, total = V.Shown().total })"#].concat());
+	drawn = V.Shown().jumps, total = V.Shown().total })"#,
+		]
+		.concat(),
+	);
 	assert_eq!(out["portal"], 1);
 	assert_eq!(out["tram"], 2);
 	assert_eq!(out["dungeon"], 2, "back where it went in: no jump");

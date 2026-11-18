@@ -724,9 +724,8 @@ local function zoneMarks(map, layer, l, r, t, b)
 		z.points = Stats.Trail(map) or {}
 		for _, pt in ipairs(z.points) do if pt ~= 0 then total = total + 1 end end
 	else
-		local h = Stats.Heat(map) or {}
-		z.cells = h[layer.key] or {}
-		for _, v in pairs(z.cells) do total = total + v end
+		z.cells, total = Stats.Heat(map, layer.key)
+		if not z.cells then z.cells, total = {}, 0 end
 	end
 	return z, total
 end

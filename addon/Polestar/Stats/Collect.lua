@@ -1,15 +1,16 @@
 -- Stats: what the Stats section draws, kept per character in
--- PolestarCharDB.stats as running totals. Nothing here is an event log and
--- nothing leaves the game: every figure is a sum, a short capped list or a
--- grid of cells, so the saved table stays small however long the character
--- is played. Off with stats.enabled: no events, no ticker, no writes; what
--- was saved stays until Stats.Reset().
+-- PolestarCharDB.stats as running totals: sums, capped lists and grids of
+-- cells, never an event log, and nothing leaves the game. Off with
+-- stats.enabled: no events, no ticker, no writes; what was saved stays until
+-- Stats.Reset().
 --
 --   Stats.Enabled() -> bool
 --   Stats.Store() -> the saved table (made when missing)
 --   Stats.Summary() -> totals over every day, for the pages (see below)
---   Stats.Heat(uiMapID) -> { t, s, k, x, q, d } cell tables | nil; Stats.HeatMaps() -> { { map, seconds }, ... }
---   Stats.Trail(uiMapID) -> the walked path's points | nil; Stats.TrailXY(point) -> x, y in percent (nil for a break)
+--   Stats.Heat(uiMapID) -> { t, s, k, x, q, d } = { [cell] = value } read out of the tiles | nil
+--   Stats.Heat(uiMapID, layer) -> that layer's cells, its exact total; Stats.HeatMaps() -> { { map, seconds }, ... }
+--   Stats.Trail(uiMapID) -> the walked path's points on a map, 0 between runs | nil
+--   Stats.TrailXY(point) -> x, y in percent (nil for a break)
 --   Stats.Routes("f" | "r") -> { [continent uiMapID] = points } flown, ridden; Stats.Jumps() -> the jumps
 --   Stats.Cell(x, y) -> cell index of a map position in percent; Stats.GRID cells a side
 --   Stats.Tick(dt) -> one sampler step (the 2 s ticker calls it; tests too)
@@ -27,10 +28,12 @@
 --   killers[npcID] = { n, name }; dungeons = { { name, t, s }, ... }; inst = the run in progress
 --   money = { { t, copper }, ... } one every MONEY_GAP seconds while it changes, at most MAX_MONEY
 --   profs[skillLine] = { first, t, rank }; ilvl
---   heat[uiMapID] = { t = { [cell] = seconds on the move }, s = seconds standing still, k = kills, x = kill XP,
---     q = quest XP, d = deaths }
---   trail[uiMapID] = { point, ... } the walked path, oldest first, at most MAX_TRAIL a zone: a point is
---     x * 10000 + y + 1 with x, y in hundredths of a percent; 0 breaks the line (a flight, a death, a jump)
+--   heat[uiMapID] = { t = seconds on the move, s = seconds standing still, k = kills, x = kill XP, q = quest XP,
+--     d = deaths }, each { n = the exact total, [tile] = string }: the zone's GRID x GRID cells in tiles of
+--     TILE x TILE, a tile with anything in it as one string (see "Heat" below), a cell's value as a level
+--   path = { -uiMapID, point, point, -uiMapID, point, ... } the walked path of the whole character, oldest
+--     first, at most MAX_PATH: a negative number starts a run on that map (after a flight, a death, a jump,
+--     another zone); a point is x * 10000 + y + 1 with x, y in hundredths of a percent
 --   routes = { f = { [continent uiMapID] = { point, ... } }, r = the same }: the routes flown on flight
 --     paths (f) and ridden on boats, zeppelins and whatever else carries the character (r), as points on
 --     the continent's map (the trail's format, at most MAX_ROUTE a continent)
@@ -40,20 +43,20 @@
 --
 -- Kills: Forever's combat log is closed to addons, so a kill is the client's
 -- XP line (CHAT_MSG_COMBAT_XP_GAIN): kills that give no XP are not counted.
--- Money: looted is what the purse gains while a loot window is open (or a
--- second after), a merchant visit is its net (less the repair bill it paid),
--- training and flights are what the purse lost across those windows.
--- Auction house, mail and trades are not followed.
+-- Money: looted is what the purse gains while a loot window is open, a
+-- merchant visit is its net (less repairs), training and flights are what the
+-- purse lost across those windows. Auction house, mail and trades are not
+-- followed.
 -- Rides: the client does not say when the character is aboard a boat or a
--- zeppelin, so a ride is being carried: the position keeps changing by more
--- than the character's own speed accounts for (as FlowUp's play log does).
+-- zeppelin, so a ride is being carried: moving faster than the character can.
 
 local ADDON, ns = ...
 local Compat = ns.Compat
 local L = ns.L
 local type, pairs, ipairs, pcall, tonumber, floor, max, min = type, pairs, ipairs, pcall, tonumber, math.floor, math.max, math.min
 local abs, sqrt = math.abs, math.sqrt
-local remove, sort = table.remove, table.sort
+local remove, sort, concat = table.remove, table.sort, table.concat
+local byte, random = string.byte, math.random
 local readable = Compat.Readable
 
 local Stats = {}
@@ -71,8 +74,12 @@ local SESSION_GAP = 300 -- a login this long after the last sample is a new sess
 local NEAR = 1 -- seconds within which an XP gain belongs to a turn-in, a discovery or a kill line
 local FOE_AGE = 10 -- seconds a foe seen in combat stays the likely killer
 local GRID = 480 -- heat cells a side of a zone map (some 7 yards a cell)
-local OLD_GRIDS = { 80, 240 } -- the grid of a v1 and of a v2 store
-local MAX_TRAIL = 6000 -- path points kept a zone, the oldest dropped first
+local TILE = 16 -- heat cells a side of a tile: a zone is GRID / TILE tiles a side
+local LEVELS = 64 -- the levels a heat cell's value is kept in: one character
+local LEVEL_EXACT = 16 -- the first levels count one by one
+local LEVEL_TOP = 1e8 -- the value of the last level
+local MAX_PATH = 20000 -- walked path points kept for the character, the oldest dropped first
+local PATH_SLACK = 500 -- ... and how far over that the path grows before it is cut back
 local TRAIL_STEP = 0.12 -- percent of the map moved before the next path point
 local TRAIL_JUMP = 4 -- percent in one sample that is no walk (a hearth, a portal): the line breaks
 local STILL = 0.01 -- percent of the map: a sample that moved less than this was standing still
@@ -88,56 +95,247 @@ local MAX_JUMPS = 300
 local JUMP_MIN = 300 -- yards between two places that make a jump
 local JUMP_SPEED = 40 -- ... crossed faster than this (yards a second), or unseen
 
-Stats.GRID, Stats.TICK = GRID, TICK
+Stats.GRID, Stats.TICK, Stats.MAX_PATH = GRID, TICK, MAX_PATH
 
 ns.RegisterDefaults("stats", { enabled = true, page = "activity", layer = "p" })
 
 function Stats.Enabled() return ns.Get("stats.enabled") and true or false end
 
 ---------------------------------------------------------------------------
+-- Heat: a zone's grid in tiles, a tile as one string
+--
+-- A table entry a cell costs some 66 bytes in memory and 20 in the saved
+-- file; a character a cell costs one. So a tile is a string of the runs of
+-- filled cells in it, in row order: a digit for the cells skipped before
+-- the run (SKIP: that many and no run), a digit for the run's length less
+-- one, then a digit a cell for its level less one. A sample rewrites the one
+-- tile the player stands in; nothing is packed or unpacked a zone.
+---------------------------------------------------------------------------
+
+local DIGITS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz+-"
+local CHAR, INDEX = {}, {}
+for i = 1, #DIGITS do
+	CHAR[i - 1] = DIGITS:sub(i, i)
+	INDEX[DIGITS:byte(i)] = i - 1
+end
+local CELLS = TILE * TILE
+local SKIP = #DIGITS - 1
+
+-- A level's value: the first LEVEL_EXACT are their own number (a kill, a
+-- death, a few seconds are kept as they are), the rest rise by one ratio to
+-- LEVEL_TOP. The map draws seven colours, so it shows no more than this.
+local VALUE = { [0] = 0 }
+do
+	local ratio = (LEVEL_TOP / LEVEL_EXACT) ^ (1 / (LEVELS - LEVEL_EXACT))
+	for l = 1, LEVELS do
+		VALUE[l] = l <= LEVEL_EXACT and l or floor(LEVEL_EXACT * ratio ^ (l - LEVEL_EXACT) + 0.5)
+	end
+end
+Stats.LEVEL_VALUE = VALUE
+
+-- 0..1, for a value between two levels (tests set it).
+function Stats.Roll() return random() end
+
+-- The level of a cell at `level` once `n` is added. A value between two
+-- levels takes the upper one as often as it lies near it, so small additions
+-- to a large value add up as they should instead of being rounded away.
+local function raised(level, n)
+	local v = VALUE[level] + n
+	while level < LEVELS and VALUE[level + 1] <= v do level = level + 1 end
+	if level < LEVELS and v > VALUE[level] and Stats.Roll() < (v - VALUE[level]) / (VALUE[level + 1] - VALUE[level]) then
+		level = level + 1
+	end
+	return level
+end
+
+-- The level nearest a value, for a store that kept the value itself.
+local function nearest(v)
+	local level = 0
+	while level < LEVELS and VALUE[level + 1] <= v do level = level + 1 end
+	if level < LEVELS and v - VALUE[level] > VALUE[level + 1] - v then level = level + 1 end
+	return max(1, level)
+end
+
+-- A cell's tile (from 1) and its place in the tile (from 0).
+local function tileOf(cell)
+	local c = cell - 1
+	local cx, cy = c % GRID, floor(c / GRID)
+	return floor(cy / TILE) * (GRID / TILE) + floor(cx / TILE) + 1, (cy % TILE) * TILE + cx % TILE
+end
+
+-- A tile's string into levels[0 .. CELLS - 1] (0: nothing there).
+local function tileLevels(str, levels)
+	for i = 0, CELLS - 1 do levels[i] = 0 end
+	if type(str) ~= "string" then return levels end
+	local at, i, n = 0, 1, #str
+	while i <= n do
+		local gap = INDEX[byte(str, i)]
+		if not gap then break end
+		at = at + gap
+		i = i + 1
+		if gap < SKIP then
+			local len = INDEX[byte(str, i)]
+			if not len then break end
+			for k = 1, len + 1 do
+				local l = INDEX[byte(str, i + k)]
+				if not l or at >= CELLS then return levels end
+				levels[at] = l + 1
+				at = at + 1
+			end
+			i = i + len + 2
+		end
+	end
+	return levels
+end
+
+-- ... and the levels back into a string; nil for an empty tile.
+local digits = {}
+local function tileString(levels)
+	local n, at, i = 0, 0, 0
+	while i < CELLS do
+		if levels[i] == 0 then
+			i = i + 1
+		else
+			local gap = i - at
+			while gap >= SKIP do
+				n = n + 1
+				digits[n] = CHAR[SKIP]
+				gap = gap - SKIP
+			end
+			local j = i
+			while j < CELLS and levels[j] ~= 0 and j - i < #DIGITS do j = j + 1 end
+			digits[n + 1], digits[n + 2] = CHAR[gap], CHAR[j - i - 1]
+			n = n + 2
+			for k = i, j - 1 do
+				n = n + 1
+				digits[n] = CHAR[levels[k] - 1]
+			end
+			at, i = j, j
+		end
+	end
+	if n == 0 then return nil end
+	return concat(digits, "", 1, n)
+end
+
+local scratch = {}
+
+-- A layer's tiles read out as { [cell] = value }.
+local function cellsOf(t)
+	local out = {}
+	if type(t) ~= "table" then return out end
+	local per = GRID / TILE
+	for tile, str in pairs(t) do
+		if type(tile) == "number" then
+			tileLevels(str, scratch)
+			local x0, y0 = (tile - 1) % per * TILE, floor((tile - 1) / per) * TILE
+			for i = 0, CELLS - 1 do
+				local l = scratch[i]
+				if l ~= 0 then out[(y0 + floor(i / TILE)) * GRID + x0 + i % TILE + 1] = VALUE[l] end
+			end
+		end
+	end
+	return out
+end
+
+-- Drops the oldest of the path once it is PATH_SLACK over MAX_PATH; what is
+-- left starts with the map its first point is on.
+local function trimPath(list)
+	local n = #list
+	if n <= MAX_PATH + PATH_SLACK then return end
+	local from, map = n - MAX_PATH + 1, nil
+	if list[from] >= 0 then
+		for i = from - 1, 1, -1 do
+			if list[i] < 0 then
+				map = list[i]
+				break
+			end
+		end
+	end
+	local to = 0
+	if map then
+		to = 1
+		list[1] = map
+	end
+	for i = from, n do
+		to = to + 1
+		list[to] = list[i]
+	end
+	for i = to + 1, n do list[i] = nil end
+end
+
+-- An older store (v3) into this one: its heat ({ [cell] = value } a layer) into tiles,
+-- its paths (one a zone, 0 at a break) into the one path.
+local function convert(s)
+	if type(s.heat) == "table" then
+		for _, h in pairs(s.heat) do
+			if type(h) == "table" then
+				for layer, cells in pairs(h) do
+					local t, tiles = { n = 0 }, {}
+					if type(cells) == "table" then
+						for cell, v in pairs(cells) do
+							if type(cell) == "number" and type(v) == "number" and v > 0 then
+								t.n = t.n + v
+								local tile, at = tileOf(cell)
+								local levels = tiles[tile]
+								if not levels then
+									levels = tileLevels(nil, {})
+									tiles[tile] = levels
+								end
+								levels[at] = nearest(v)
+							end
+						end
+					end
+					for tile, levels in pairs(tiles) do t[tile] = tileString(levels) end
+					h[layer] = t
+				end
+			end
+		end
+	end
+	local path = {}
+	if type(s.trail) == "table" then
+		local maps = {}
+		for map, list in pairs(s.trail) do
+			if type(map) == "number" and type(list) == "table" then maps[#maps + 1] = map end
+		end
+		sort(maps)
+		for _, map in ipairs(maps) do
+			local open = false
+			for _, p in ipairs(s.trail[map]) do
+				if p == 0 then
+					open = false
+				elseif type(p) == "number" then
+					if not open then
+						path[#path + 1] = -map
+						open = true
+					end
+					path[#path + 1] = p
+				end
+			end
+		end
+	end
+	s.trail, s.path = nil, path
+	trimPath(path)
+end
+
+---------------------------------------------------------------------------
 -- The store
 ---------------------------------------------------------------------------
 
-local TABLES = { "days", "old", "hours", "weekdays", "levels", "quests", "open", "killers", "dungeons", "money", "profs", "heat", "trail", "routes", "jumps" }
+local pathOf -- Stats.Trail's: { [map] = points }, until the path grows
+
+local TABLES = { "days", "old", "hours", "weekdays", "levels", "quests", "open", "killers", "dungeons", "money", "profs", "heat", "path", "routes", "jumps" }
 
 function Stats.Store()
 	local cs = ns.CharState()
 	local s = cs.stats
 	if type(s) ~= "table" then
-		s = { v = 3 }
+		s = { v = 4 }
 		cs.stats = s
 	end
-	if s.v ~= 3 then
-		-- An older store kept heat on a coarser grid. Twice as coarse (v2): each cell is
-		-- shared out over the four it covers; else (v1) it moves to the cell at its middle.
-		local old = OLD_GRIDS[s.v] or OLD_GRIDS[1]
-		if type(s.heat) == "table" then
-			for _, h in pairs(s.heat) do
-				if type(h) == "table" then
-					for layer, cells in pairs(h) do
-						local out = {}
-						if type(cells) == "table" then
-							for cell, n in pairs(cells) do
-								local cx, cy = (cell - 1) % old, floor((cell - 1) / old)
-								if old * 2 == GRID then
-									for dy = 0, 1 do
-										for dx = 0, 1 do
-											local to = (cy * 2 + dy) * GRID + cx * 2 + dx + 1
-											out[to] = (out[to] or 0) + n / 4
-										end
-									end
-								else
-									local to = Stats.Cell((cx + 0.5) / old * 100, (cy + 0.5) / old * 100)
-									out[to] = (out[to] or 0) + n
-								end
-							end
-						end
-						h[layer] = out
-					end
-				end
-			end
-		end
-		s.v = 3
+	if s.v ~= 4 then
+		convert(s)
+		pathOf = nil
+		s.v = 4
 	end
 	for _, k in ipairs(TABLES) do if type(s[k]) ~= "table" then s[k] = {} end end
 	if type(s.active) ~= "number" then s.active = 0 end
@@ -147,6 +345,7 @@ end
 
 function Stats.Reset()
 	ns.CharState().stats = nil
+	pathOf = nil
 	if Stats.TrailBreak then Stats.TrailBreak() end
 	if Stats.TravelBreak then Stats.TravelBreak() end
 	ns.Fire("STATS_UPDATED")
@@ -259,7 +458,7 @@ local function addPoint(list, x, y, joined, cap)
 	end
 end
 
--- The walked path: a point when the player has moved far enough, a break
+-- The walked path: a point when the player has moved far enough, a new run
 -- where the line must not join (off the ground, a jump, another zone).
 local lastMap, lastX, lastY
 
@@ -278,18 +477,33 @@ local function trail(s)
 		if d2 < TRAIL_STEP * TRAIL_STEP then return end
 		if d2 > TRAIL_JUMP * TRAIL_JUMP then joined = false end
 	end
-	local list = s.trail[map]
-	if type(list) ~= "table" then
-		list = {}
-		s.trail[map] = list
-	end
-	addPoint(list, x, y, joined, MAX_TRAIL)
+	local list = s.path
+	if not joined then list[#list + 1] = -map end
+	list[#list + 1] = pointOf(x, y)
+	trimPath(list)
+	pathOf = nil
 	lastMap, lastX, lastY = map, x, y
 end
 
 function Stats.Trail(map)
-	local list = Stats.Store().trail[map]
-	return type(list) == "table" and list or nil
+	if not pathOf then
+		pathOf = {}
+		local list
+		for _, p in ipairs(Stats.Store().path) do
+			if p < 0 then
+				list = pathOf[-p]
+				if not list then
+					list = {}
+					pathOf[-p] = list
+				elseif list[#list] ~= 0 then
+					list[#list + 1] = 0
+				end
+			elseif list then
+				list[#list + 1] = p
+			end
+		end
+	end
+	return pathOf[map]
 end
 
 function Stats.TrailXY(point)
@@ -459,10 +673,9 @@ end
 
 local stillMap, stillX, stillY -- where the last sample was, for standing() (below)
 
--- A jump: the character was last seen in one place and is now in another,
--- too far to have walked there since (a portal, a hearthstone, the tram:
--- anything the client shows no journey for). `travelling`: on a flight, a
--- ride or dead, where the next place seen is no jump.
+-- A jump: the character is too far from where it was last seen to have
+-- walked there (a portal, a hearthstone, the tram). `travelling`: on a
+-- flight, a ride or dead, where the next place seen is no jump.
 local seen = {}
 
 local function sampleJump(s, travelling, map, x, y, wx, wy)
@@ -516,15 +729,29 @@ local function heat(s, layer, n)
 	end
 	local t = h[layer]
 	if type(t) ~= "table" then
-		t = {}
+		t = { n = 0 }
 		h[layer] = t
 	end
-	t[cell] = (t[cell] or 0) + n
+	t.n = (t.n or 0) + n
+	local tile, at = tileOf(cell)
+	tileLevels(t[tile], scratch)
+	local to = raised(scratch[at], n)
+	if to ~= scratch[at] then
+		scratch[at] = to
+		t[tile] = tileString(scratch)
+	end
 end
 
-function Stats.Heat(map)
+function Stats.Heat(map, layer)
 	local h = Stats.Store().heat[map]
-	return type(h) == "table" and h or nil
+	if type(h) ~= "table" then return nil end
+	if layer then
+		local t = h[layer]
+		return cellsOf(t), type(t) == "table" and t.n or 0
+	end
+	local out = {}
+	for k, t in pairs(h) do out[k] = cellsOf(t) end
+	return out
 end
 
 -- The maps with anything on them, the longest stayed in first.
@@ -534,8 +761,7 @@ function Stats.HeatMaps()
 		local seconds = 0
 		if type(h) == "table" then
 			-- (on the move and standing still: all the time there)
-			if type(h.t) == "table" then for _, v in pairs(h.t) do seconds = seconds + v end end
-			if type(h.s) == "table" then for _, v in pairs(h.s) do seconds = seconds + v end end
+			seconds = (type(h.t) == "table" and h.t.n or 0) + (type(h.s) == "table" and h.s.n or 0)
 		end
 		out[#out + 1] = { map = map, seconds = seconds }
 	end
